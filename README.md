@@ -12,7 +12,7 @@ account, not as a hosted multi-customer service.
 
 ```mermaid
 flowchart LR
-    P[Paystack] -->|raw POST| I[/in/{source}/]
+    P[Paystack] -->|raw POST| I["POST /in/{source}"]
     I --> V[HMAC-SHA512 + IP check]
     V --> D[(Postgres events)]
     D --> Q[(Postgres deliveries)]
@@ -39,14 +39,14 @@ git config core.hooksPath .githooks
 cargo test
 ```
 
-Set `FANOUT_CONFIG` and `DATABASE_URL`, then run:
+Set `DATABASE_URL`, `PAYSTACK_SECRET_KEY`, and `FANOUT_ENCRYPTION_KEY`, then run:
 
 ```sh
 cargo run -- --role all
 ```
 
-The default listener is `0.0.0.0:8080`. The Paystack URL is
-`https://your-host/in/paystack_main`.
+The listener binds to `0.0.0.0` and uses `PORT`, defaulting to `8080`. The
+Paystack URL is `https://your-host/in/paystack_main`.
 
 For the browser console, set a 32-byte `FANOUT_ENCRYPTION_KEY`, then create the
 first owner after migrations run:
@@ -62,9 +62,13 @@ development; production keeps secure cookies enabled by default.
 
 ## Configuration
 
-`FANOUT_CONFIG` points to a TOML file. Secret values are never read from that
-file; `secret_env` names the environment variable that holds the value.
-Start from [config.example.toml](config.example.toml).
+`FANOUT_CONFIG` is optional and is used only as a first-boot seed. If it is
+unset or missing, the service starts with a Paystack source named
+`paystack_main`, no routes, and the default 90-day retention. Routes and
+sources are then managed in the dashboard and stored in Postgres. Secret
+values are never read directly from the file; `secret_env` names the
+environment variable that holds the value. Start local development from
+[config.example.toml](config.example.toml).
 
 ```toml
 [source.paystack_main]
@@ -74,7 +78,7 @@ allowed_ips = ["52.31.139.75", "52.49.173.169", "52.214.14.220"]
 
 [[route]]
 name = "timamu"
-destination_url = "https://api.timamu.app/v1/billing/paystack/webhook"
+destination_url = "https://example.invalid/timamu/paystack/webhook"
 match = { metadata_app = "timamu", plan_code_prefix = "PLN_tm", reference_prefix = "tm_" }
 
 [fallback]
@@ -186,17 +190,22 @@ When the token is unset, admin routes return 404. `/healthz` is liveness,
 including received, signature failures, duplicates, deliveries, retries,
 dead events, unrouted events, shadow misses, and a delivery latency histogram.
 
-## Railway deployment
+## Deploy on Railway
 
 1. Create a Railway project with a Postgres service.
-2. Deploy this repository as a Docker service; `railway.toml` selects the
-   Dockerfile and `/readyz` health check.
-3. Set `DATABASE_URL`, `FANOUT_CONFIG`, `PAYSTACK_SECRET_KEY`, and destination
-   URLs in the Railway environment. Add `ADMIN_TOKEN` and
-   `ALERT_WEBHOOK_URL` only when needed.
-4. Use the service public URL as the Paystack webhook URL in test mode.
-5. Restrict access to admin routes at the network edge as an additional
-   control when possible.
+2. Deploy this repository as a Railway service. Railway builds directly from
+   the repository `Dockerfile`.
+3. Set these required variables in the service environment:
+   - `DATABASE_URL`: reference the Railway Postgres service variable, for
+     example `${{Postgres.DATABASE_URL}}`.
+   - `PAYSTACK_SECRET_KEY`: the Paystack secret key for the selected mode.
+   - `FANOUT_ENCRYPTION_KEY`: create one with `openssl rand -hex 32`.
+4. In Railway service settings, set the health check path to `/readyz`.
+5. Run `paystack-fanout create-owner --email you@example.com` after the first
+   deploy, then enable 2FA.
+6. Use the service public URL as the Paystack webhook URL in test mode.
+7. Add routes and sources from the dashboard; do not deploy a production route
+   file.
 
 ## Rollout guide
 

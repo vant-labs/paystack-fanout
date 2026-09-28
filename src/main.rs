@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, path::Path, sync::Arc};
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
@@ -22,13 +22,8 @@ enum Role {
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,
-    #[arg(
-        long,
-        global = true,
-        env = "FANOUT_CONFIG",
-        default_value = "config.toml"
-    )]
-    config: String,
+    #[arg(long, global = true, env = "FANOUT_CONFIG")]
+    config: Option<String>,
     #[arg(long, global = true, env = "DATABASE_URL")]
     database_url: Option<String>,
     #[arg(long, global = true, env = "PORT", default_value_t = 8080)]
@@ -55,7 +50,13 @@ async fn main() -> Result<()> {
     let database_url = args
         .database_url
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("DATABASE_URL or --database-url is required"))?;
+        .ok_or_else(|| anyhow::anyhow!("missing required environment variable DATABASE_URL"))?;
+    std::env::var("PAYSTACK_SECRET_KEY").map_err(|_| {
+        anyhow::anyhow!("missing required environment variable PAYSTACK_SECRET_KEY")
+    })?;
+    std::env::var("FANOUT_ENCRYPTION_KEY").map_err(|_| {
+        anyhow::anyhow!("missing required environment variable FANOUT_ENCRYPTION_KEY")
+    })?;
     let db = Database::connect(database_url).await?;
     db.migrate().await?;
     if let Some(Command::CreateOwner { email }) = args.command {
@@ -70,14 +71,10 @@ async fn main() -> Result<()> {
         println!("Owner created: {id}");
         return Ok(());
     }
-    let config = Config::load(&args.config)?;
-    if std::env::var("FANOUT_ENCRYPTION_KEY").is_ok() {
-        db.seed_runtime_config(&config).await?;
-    }
+    let config = Config::load(args.config.as_deref().map(Path::new))?;
+    db.seed_runtime_config(&config).await?;
     let state = Arc::new(AppState::new(config, db)?);
-    if std::env::var("FANOUT_ENCRYPTION_KEY").is_ok() {
-        state.reload_runtime_config().await?;
-    }
+    state.reload_runtime_config().await?;
     if matches!(args.role, Role::Worker | Role::All) {
         tokio::spawn(run_worker(state.clone()));
         tokio::spawn(retention_loop(state.clone()));

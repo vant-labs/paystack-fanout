@@ -52,16 +52,57 @@ pub struct AlertsConfig {
 }
 
 impl Config {
-    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading config {}", path.display()))?;
+    pub fn load(path: Option<&Path>) -> Result<Self> {
+        let text = match path {
+            None => {
+                tracing::info!("no config file was found and routes come from the database");
+                return Self::defaults();
+            }
+            Some(path) => match std::fs::read_to_string(path) {
+                Ok(text) => text,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::info!("no config file was found and routes come from the database");
+                    return Self::defaults();
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("reading config {}", path.display()));
+                }
+            },
+        };
         let mut config: Self = toml::from_str(&text).context("parsing TOML config")?;
-        if let Ok(value) = env::var("RETENTION_DAYS") {
-            config.retention_days = value.parse().context("parsing RETENTION_DAYS")?;
-        }
+        config.apply_retention_override()?;
         config.validate()?;
         Ok(config)
+    }
+
+    fn defaults() -> Result<Self> {
+        let mut config = Self {
+            source: HashMap::from([(
+                "paystack_main".to_owned(),
+                SourceConfig {
+                    provider: "paystack".to_owned(),
+                    secret_env: "PAYSTACK_SECRET_KEY".to_owned(),
+                    allowed_ips: Vec::new(),
+                },
+            )]),
+            route: Vec::new(),
+            fallback: FallbackConfig {
+                mode: "unrouted".to_owned(),
+            },
+            alerts: None,
+            retention_days: default_retention_days(),
+        };
+        config.apply_retention_override()?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn apply_retention_override(&mut self) -> Result<()> {
+        if let Ok(value) = env::var("RETENTION_DAYS") {
+            self.retention_days = value.parse().context("parsing RETENTION_DAYS")?;
+        }
+        Ok(())
     }
 
     pub fn secret_for(&self, source: &str) -> Result<String> {
@@ -78,7 +119,6 @@ impl Config {
 
     fn validate(&self) -> Result<()> {
         anyhow::ensure!(!self.source.is_empty(), "at least one source is required");
-        anyhow::ensure!(!self.route.is_empty(), "at least one route is required");
         let mut names = std::collections::HashSet::new();
         for route in &self.route {
             anyhow::ensure!(names.insert(&route.name), "duplicate route {}", route.name);
@@ -105,5 +145,23 @@ impl Config {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn missing_config_uses_database_managed_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::load(Some(&directory.path().join("missing.toml"))).unwrap();
+        assert_eq!(config.source.len(), 1);
+        let source = config.source.get("paystack_main").unwrap();
+        assert_eq!(source.provider, "paystack");
+        assert_eq!(source.secret_env, "PAYSTACK_SECRET_KEY");
+        assert!(config.route.is_empty());
+        assert_eq!(config.fallback.mode, "unrouted");
+        assert_eq!(config.retention_days, 90);
     }
 }

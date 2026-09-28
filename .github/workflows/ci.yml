@@ -85,9 +85,21 @@ jobs:
           SQLX_OFFLINE: true
           DATABASE_URL: postgres://fanout:fanout@localhost:5432/fanout
           PAYSTACK_SECRET_KEY: sk_test_ci
+          FANOUT_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 
   docker:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: fanout
+          POSTGRES_PASSWORD: fanout
+          POSTGRES_DB: fanout
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd="pg_isready -U fanout -d fanout"
+          --health-interval=10s --health-timeout=5s --health-retries=5
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -95,7 +107,19 @@ jobs:
         with:
           context: .
           push: false
+          load: true
           tags: paystack-fanout:ci
+      - name: Docker smoke
+        run: |
+          set -euo pipefail
+          unset PORT FANOUT_CONFIG
+          container_id="$(docker run -d --network host --name paystack-fanout-docker-smoke \
+            -e DATABASE_URL=postgres://fanout:fanout@127.0.0.1:5432/fanout \
+            -e PAYSTACK_SECRET_KEY=sk_test_ci \
+            -e FANOUT_ENCRYPTION_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+            paystack-fanout:ci)"
+          trap 'docker logs "$container_id"; docker rm -f "$container_id"' EXIT
+          timeout 60 bash -c 'until curl -fsS http://127.0.0.1:8080/readyz; do sleep 1; done'
 
   dashboard-smoke:
     runs-on: ubuntu-latest

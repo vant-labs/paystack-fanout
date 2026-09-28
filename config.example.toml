@@ -5,12 +5,12 @@ allowed_ips = ["52.31.139.75", "52.49.173.169", "52.214.14.220"]
 
 [[route]]
 name = "timamu"
-destination_url = "https://api.timamu.app/v1/billing/paystack/webhook"
+destination_url = "https://example.invalid/timamu/paystack/webhook"
 match = { metadata_app = "timamu", plan_code_prefix = "PLN_tm", reference_prefix = "tm_" }
 
 [[route]]
 name = "screencrafter"
-destination_url = "https://api.screencrafter.io/your/paystack/webhook"
+destination_url = "https://example.invalid/screencrafter/paystack/webhook"
 match = { metadata_app = "screencrafter", reference_prefix = "sc_" }
 
 [fallback]
@@ -18,4 +18,3 @@ mode = "unrouted"
 
 [alerts]
 webhook_url_env = "ALERT_WEBHOOK_URL"
-
