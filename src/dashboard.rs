@@ -21,7 +21,9 @@ use crate::{
         SessionUser, clear_session_cookie, csrf_matches, random_token, session_cookie,
         session_token, verify_password,
     },
+    config::RouteMatcher,
     db::{AuditEntry, EventDetail, EventSummary, OverviewStats},
+    db::{RouteView, SourceView},
 };
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -39,6 +41,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/dashboard/retries", get(retries))
         .route("/dashboard/unrouted", get(unrouted))
         .route("/dashboard/audit", get(audit))
+        .route("/dashboard/config", get(configuration))
+        .route("/dashboard/config/route", post(save_route))
+        .route("/dashboard/config/source", post(save_source))
+        .route("/dashboard/config/test-route", post(test_route))
         .route("/static/{*path}", get(static_asset))
 }
 
@@ -103,6 +109,18 @@ struct AuditPage {
     entries: Vec<AuditEntry>,
 }
 
+#[derive(Debug, Clone, Template)]
+#[template(path = "configuration.html")]
+struct ConfigurationPage {
+    user: SessionUser,
+    sources: Vec<SourceView>,
+    routes: Vec<RouteView>,
+    csrf: String,
+    message: Option<String>,
+    error: Option<String>,
+    test_result: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct LoginForm {
     email: String,
@@ -113,6 +131,36 @@ struct LoginForm {
 struct ReplayForm {
     csrf: String,
     route: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RouteForm {
+    csrf: String,
+    name: String,
+    destination_url: String,
+    metadata_app: Option<String>,
+    plan_code_prefix: Option<String>,
+    reference_prefix: Option<String>,
+    timeout_seconds: i32,
+    max_attempts: i32,
+    enabled: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceForm {
+    csrf: String,
+    name: String,
+    provider: String,
+    secret: Option<String>,
+    allowed_ips: Option<String>,
+    enabled: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TestRouteForm {
+    csrf: String,
+    route: String,
+    payload: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -392,9 +440,10 @@ async fn replay(
     if !user.role.can_write() || !csrf_matches(&user.csrf_token, Some(&form.csrf)) {
         return (StatusCode::FORBIDDEN, "Action not permitted").into_response();
     }
+    let active_config = state.runtime_config.read().await.clone();
     match state
         .db
-        .replay(id, form.route.as_deref(), &state.config)
+        .replay(id, form.route.as_deref(), &active_config)
         .await
     {
         Ok(true) => {
@@ -608,6 +657,210 @@ async fn audit(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
         Ok(entries) => render(AuditPage { user, entries }),
         Err(error) => server_error(error),
     }
+}
+
+async fn configuration(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let Some(user) = require_user(&state, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    let sources = match state.db.list_sources().await {
+        Ok(sources) => sources,
+        Err(error) => return server_error(error),
+    };
+    let routes = match state.db.list_routes().await {
+        Ok(routes) => routes,
+        Err(error) => return server_error(error),
+    };
+    render(ConfigurationPage {
+        user,
+        sources,
+        routes,
+        csrf: current_csrf(&state, &headers).await.unwrap_or_default(),
+        message: None,
+        error: None,
+        test_result: None,
+    })
+}
+
+async fn save_route(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<RouteForm>,
+) -> Response {
+    let Some(user) = require_user(&state, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    if !user.can_write || !csrf_matches(&user.csrf_token, Some(&form.csrf)) {
+        return (StatusCode::FORBIDDEN, "Action not permitted").into_response();
+    }
+    let name = form.name.trim();
+    if name.is_empty()
+        || !(form.destination_url.starts_with("https://")
+            || form.destination_url.starts_with("http://"))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Route name and an http(s) destination are required",
+        )
+            .into_response();
+    }
+    if !(1..=60).contains(&form.timeout_seconds) || !(1..=10).contains(&form.max_attempts) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Timeout must be 1–60 seconds and attempts must be 1–10",
+        )
+            .into_response();
+    }
+    let matcher = RouteMatcher {
+        metadata_app: clean_option(form.metadata_app),
+        plan_code_prefix: clean_option(form.plan_code_prefix),
+        reference_prefix: clean_option(form.reference_prefix),
+    };
+    match state
+        .db
+        .save_route(
+            name,
+            form.destination_url.trim(),
+            &matcher,
+            form.timeout_seconds,
+            form.max_attempts,
+            form.enabled.is_some(),
+        )
+        .await
+    {
+        Ok(()) => {
+            if let Err(error) = state.reload_runtime_config().await {
+                return server_error(error);
+            }
+            let _ = state
+                .db
+                .audit(
+                    Some(user.id),
+                    "route_edit",
+                    Some("route"),
+                    Some(name),
+                    &serde_json::json!({"enabled": form.enabled.is_some()}),
+                    None,
+                )
+                .await;
+            Redirect::to("/dashboard/config").into_response()
+        }
+        Err(error) => server_error(error),
+    }
+}
+
+async fn save_source(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<SourceForm>,
+) -> Response {
+    let Some(user) = require_user(&state, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    if !user.role.can_manage() || !csrf_matches(&user.csrf_token, Some(&form.csrf)) {
+        return (StatusCode::FORBIDDEN, "Owner access is required").into_response();
+    }
+    let name = form.name.trim();
+    if name.is_empty() || form.provider.trim() != "paystack" {
+        return (
+            StatusCode::BAD_REQUEST,
+            "A source name and the paystack provider are required",
+        )
+            .into_response();
+    }
+    let allowed_ips = form
+        .allowed_ips
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if let Err(error) = allowed_ips.iter().try_for_each(|value| {
+        value
+            .parse::<std::net::IpAddr>()
+            .map(|_| ())
+            .map_err(|_| value)
+    }) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid source IP: {error}"),
+        )
+            .into_response();
+    }
+    let secret = form
+        .secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match state
+        .db
+        .save_source(
+            name,
+            form.provider.trim(),
+            secret,
+            &allowed_ips,
+            form.enabled.is_some(),
+        )
+        .await
+    {
+        Ok(()) => {
+            if let Err(error) = state.reload_runtime_config().await {
+                return server_error(error);
+            }
+            let _ = state.db.audit(Some(user.id), "source_edit", Some("source"), Some(name), &serde_json::json!({"enabled": form.enabled.is_some(), "secret_changed": secret.is_some()}), None).await;
+            Redirect::to("/dashboard/config").into_response()
+        }
+        Err(error) => server_error(error),
+    }
+}
+
+async fn test_route(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<TestRouteForm>,
+) -> Response {
+    let Some(user) = require_user(&state, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    if !csrf_matches(&user.csrf_token, Some(&form.csrf)) {
+        return (StatusCode::FORBIDDEN, "Action not permitted").into_response();
+    }
+    let payload = match serde_json::from_str::<Value>(&form.payload) {
+        Ok(payload) => payload,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Payload must be valid JSON").into_response(),
+    };
+    let config = state.runtime_config.read().await.clone();
+    let decision = crate::routing::decide(&config, &payload);
+    let test_result = match decision.route {
+        Some(route) if route.name == form.route => {
+            format!("Matched {} via {:?}.", route.name, decision.source)
+        }
+        Some(route) => format!(
+            "Payload matched {} instead of {} via {:?}.",
+            route.name, form.route, decision.source
+        ),
+        None => format!("No route matched; fallback is {}.", config.fallback.mode),
+    };
+    let sources = state.db.list_sources().await.unwrap_or_default();
+    let routes = state.db.list_routes().await.unwrap_or_default();
+    render(ConfigurationPage {
+        user,
+        sources,
+        routes,
+        csrf: current_csrf(&state, &headers).await.unwrap_or_default(),
+        message: None,
+        error: None,
+        test_result: Some(test_result),
+    })
+}
+
+fn clean_option(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let value = value.trim().to_owned();
+        (!value.is_empty()).then_some(value)
+    })
 }
 
 async fn static_asset(Path(path): Path<String>) -> Response {

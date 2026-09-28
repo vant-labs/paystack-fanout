@@ -9,7 +9,8 @@ use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use uuid::Uuid;
 
 use crate::auth::{Role, SessionUser, token_hash};
-use crate::config::Config;
+use crate::config::{Config, RouteConfig, RouteMatcher, SourceConfig};
+use crate::crypto::{decrypt, encrypt};
 
 #[derive(Clone)]
 pub struct Database {
@@ -90,6 +91,25 @@ pub struct OverviewStats {
     pub delivered_with_delivery: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct SourceView {
+    pub name: String,
+    pub provider: String,
+    pub allowed_ips: Vec<String>,
+    pub enabled: bool,
+    pub secret_present: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RouteView {
+    pub name: String,
+    pub destination_url: String,
+    pub matcher: RouteMatcher,
+    pub timeout_seconds: i32,
+    pub max_attempts: i32,
+    pub enabled: bool,
+}
+
 impl Database {
     pub async fn connect(url: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
@@ -106,6 +126,194 @@ impl Database {
             .run(&self.pool)
             .await
             .context("running migrations")?;
+        Ok(())
+    }
+
+    pub async fn seed_runtime_config(&self, config: &Config) -> Result<()> {
+        let source_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sources")
+            .fetch_one(&self.pool)
+            .await?;
+        let route_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM routes")
+            .fetch_one(&self.pool)
+            .await?;
+        let mut tx = self.pool.begin().await?;
+        if source_count == 0 {
+            for (name, source) in &config.source {
+                let secret = config.secret_for(name)?;
+                sqlx::query("INSERT INTO sources (id, name, provider, secret_ciphertext, allowed_ips, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, now(), now())")
+                    .bind(Uuid::new_v4())
+                    .bind(name)
+                    .bind(&source.provider)
+                    .bind(encrypt(&secret)?)
+                    .bind(serde_json::to_value(&source.allowed_ips)?)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        if route_count == 0 {
+            for route in &config.route {
+                sqlx::query("INSERT INTO routes (id, name, destination_url, matcher, created_at, updated_at) VALUES ($1, $2, $3, $4, now(), now())")
+                    .bind(Uuid::new_v4())
+                    .bind(&route.name)
+                    .bind(&route.destination_url)
+                    .bind(serde_json::to_value(&route.matcher)?)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn load_runtime_config(
+        &self,
+        base: &Config,
+    ) -> (Config, std::collections::HashMap<String, String>) {
+        let mut config = base.clone();
+        let mut secrets = std::collections::HashMap::new();
+        let source_rows = sqlx::query("SELECT name, provider, secret_ciphertext, allowed_ips FROM sources WHERE enabled = true ORDER BY name")
+            .fetch_all(&self.pool)
+            .await;
+        if let Ok(rows) = source_rows
+            && !rows.is_empty()
+        {
+            config.source.clear();
+            for row in rows {
+                let name: String = match row.try_get("name") {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let provider: String = match row.try_get("provider") {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let ciphertext: String = match row.try_get("secret_ciphertext") {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let allowed_ips = row
+                    .try_get("allowed_ips")
+                    .ok()
+                    .and_then(|value: Value| serde_json::from_value(value).ok())
+                    .unwrap_or_default();
+                if let Ok(secret) = decrypt(&ciphertext) {
+                    secrets.insert(name.clone(), secret);
+                }
+                config.source.insert(
+                    name,
+                    SourceConfig {
+                        provider,
+                        secret_env: "FANOUT_DB_SECRET".to_owned(),
+                        allowed_ips,
+                    },
+                );
+            }
+        }
+        let route_rows = sqlx::query(
+            "SELECT name, destination_url, matcher FROM routes WHERE enabled = true ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await;
+        if let Ok(rows) = route_rows
+            && !rows.is_empty()
+        {
+            config.route = rows
+                .into_iter()
+                .filter_map(|row| {
+                    let name: String = row.try_get("name").ok()?;
+                    let destination_url: String = row.try_get("destination_url").ok()?;
+                    let matcher: Value = row.try_get("matcher").ok()?;
+                    let matcher: RouteMatcher = serde_json::from_value(matcher).ok()?;
+                    Some(RouteConfig {
+                        name,
+                        destination_url,
+                        matcher,
+                    })
+                })
+                .collect();
+        }
+        (config, secrets)
+    }
+
+    pub async fn list_sources(&self) -> Result<Vec<SourceView>> {
+        let rows = sqlx::query("SELECT name, provider, allowed_ips, enabled, secret_ciphertext <> '' AS secret_present FROM sources ORDER BY name")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let allowed: Value = row.try_get("allowed_ips")?;
+                Ok(SourceView {
+                    name: row.try_get("name")?,
+                    provider: row.try_get("provider")?,
+                    allowed_ips: serde_json::from_value::<Vec<String>>(allowed).unwrap_or_default(),
+                    enabled: row.try_get("enabled")?,
+                    secret_present: row.try_get("secret_present")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(Into::into)
+    }
+
+    pub async fn list_routes(&self) -> Result<Vec<RouteView>> {
+        let rows = sqlx::query("SELECT name, destination_url, matcher, timeout_seconds, max_attempts, enabled FROM routes ORDER BY name")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let matcher: Value = row.try_get("matcher")?;
+                Ok(RouteView {
+                    name: row.try_get("name")?,
+                    destination_url: row.try_get("destination_url")?,
+                    matcher: serde_json::from_value(matcher).unwrap_or_default(),
+                    timeout_seconds: row.try_get("timeout_seconds")?,
+                    max_attempts: row.try_get("max_attempts")?,
+                    enabled: row.try_get("enabled")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(Into::into)
+    }
+
+    pub async fn save_route(
+        &self,
+        name: &str,
+        destination_url: &str,
+        matcher: &RouteMatcher,
+        timeout_seconds: i32,
+        max_attempts: i32,
+        enabled: bool,
+    ) -> Result<()> {
+        sqlx::query("INSERT INTO routes (id, name, destination_url, matcher, timeout_seconds, max_attempts, enabled, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now()) ON CONFLICT (name) DO UPDATE SET destination_url = EXCLUDED.destination_url, matcher = EXCLUDED.matcher, timeout_seconds = EXCLUDED.timeout_seconds, max_attempts = EXCLUDED.max_attempts, enabled = EXCLUDED.enabled, updated_at = now()")
+            .bind(Uuid::new_v4())
+            .bind(name)
+            .bind(destination_url)
+            .bind(serde_json::to_value(matcher)?)
+            .bind(timeout_seconds)
+            .bind(max_attempts)
+            .bind(enabled)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn save_source(
+        &self,
+        name: &str,
+        provider: &str,
+        secret: Option<&str>,
+        allowed_ips: &[String],
+        enabled: bool,
+    ) -> Result<()> {
+        let ciphertext = secret.map(encrypt).transpose()?;
+        sqlx::query("INSERT INTO sources (id, name, provider, secret_ciphertext, allowed_ips, enabled, created_at, updated_at) VALUES ($1, $2, $3, COALESCE($4, ''), $5, $6, now(), now()) ON CONFLICT (name) DO UPDATE SET provider = EXCLUDED.provider, secret_ciphertext = CASE WHEN $4 IS NULL THEN sources.secret_ciphertext ELSE EXCLUDED.secret_ciphertext END, allowed_ips = EXCLUDED.allowed_ips, enabled = EXCLUDED.enabled, updated_at = now()")
+            .bind(Uuid::new_v4())
+            .bind(name)
+            .bind(provider)
+            .bind(ciphertext)
+            .bind(serde_json::to_value(allowed_ips)?)
+            .bind(enabled)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -184,6 +392,8 @@ impl Database {
                     .ok_or_else(|| sqlx::Error::Protocol("invalid user role".into()))?,
                 can_write: Role::parse(row.try_get::<String, _>("role")?.as_str())
                     .is_some_and(Role::can_write),
+                can_manage: Role::parse(row.try_get::<String, _>("role")?.as_str())
+                    .is_some_and(Role::can_manage),
                 csrf_token: row.try_get("csrf_token")?,
                 session_token: token.to_owned(),
             })

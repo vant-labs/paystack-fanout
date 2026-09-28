@@ -1,7 +1,7 @@
 use std::{collections::HashMap, env, net::IpAddr, path::Path};
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -34,7 +34,7 @@ pub struct RouteConfig {
     pub matcher: RouteMatcher,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RouteMatcher {
     pub metadata_app: Option<String>,
     pub plan_code_prefix: Option<String>,

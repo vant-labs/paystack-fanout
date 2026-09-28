@@ -64,7 +64,13 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let config = Config::load(&args.config)?;
+    if std::env::var("FANOUT_ENCRYPTION_KEY").is_ok() {
+        db.seed_runtime_config(&config).await?;
+    }
     let state = Arc::new(AppState::new(config, db)?);
+    if std::env::var("FANOUT_ENCRYPTION_KEY").is_ok() {
+        state.reload_runtime_config().await?;
+    }
     if matches!(args.role, Role::Worker | Role::All) {
         tokio::spawn(run_worker(state.clone()));
         tokio::spawn(retention_loop(state.clone()));

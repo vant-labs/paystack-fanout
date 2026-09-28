@@ -57,6 +57,7 @@ pub struct SessionUser {
     pub initial: String,
     pub role: Role,
     pub can_write: bool,
+    pub can_manage: bool,
     #[serde(skip)]
     pub csrf_token: String,
     #[serde(skip)]

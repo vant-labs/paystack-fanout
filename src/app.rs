@@ -38,6 +38,8 @@ pub struct AppState {
     pub admin_token: Option<String>,
     pub cookie_secure: bool,
     pub login_limits: Arc<std::sync::Mutex<HashMap<String, (u32, Instant)>>>,
+    pub runtime_config: Arc<tokio::sync::RwLock<Config>>,
+    pub runtime_secrets: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
     alert_url_override: Option<String>,
 }
 
@@ -51,6 +53,7 @@ impl AppState {
         db: Database,
         alert_url_override: Option<String>,
     ) -> anyhow::Result<Self> {
+        let runtime_config = config.clone();
         Ok(Self {
             config,
             db,
@@ -65,8 +68,17 @@ impl AppState {
                 .map(|value| !value.eq_ignore_ascii_case("false"))
                 .unwrap_or(true),
             login_limits: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            runtime_config: Arc::new(tokio::sync::RwLock::new(runtime_config)),
+            runtime_secrets: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             alert_url_override,
         })
+    }
+
+    pub async fn reload_runtime_config(&self) -> anyhow::Result<()> {
+        let (config, secrets) = self.db.load_runtime_config(&self.config).await;
+        *self.runtime_config.write().await = config;
+        *self.runtime_secrets.write().await = secrets;
+        Ok(())
     }
 
     pub async fn alert(&self, text: String) {
@@ -111,7 +123,9 @@ async fn ingest(
     remote: ConnectInfo<SocketAddr>,
     body: Bytes,
 ) -> Response {
-    let Some(source_config) = state.config.source.get(&source) else {
+    let active_config = state.runtime_config.read().await.clone();
+    let active_secrets = state.runtime_secrets.read().await.clone();
+    let Some(source_config) = active_config.source.get(&source) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     if !allowed_ip(
@@ -126,10 +140,14 @@ async fn ingest(
     let signature = headers
         .get("x-paystack-signature")
         .and_then(|value| value.to_str().ok());
-    let secret = match state.config.secret_for(&source) {
-        Ok(secret) => secret,
-        Err(error) => {
-            tracing::error!(source = %source, error = %error, "source secret unavailable");
+    let secret = match active_secrets
+        .get(&source)
+        .cloned()
+        .or_else(|| active_config.secret_for(&source).ok())
+    {
+        Some(secret) => secret,
+        None => {
+            tracing::error!(source = %source, "source secret unavailable");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -155,7 +173,7 @@ async fn ingest(
         }
     };
     let event_type = PaystackProvider.event_type(&payload);
-    let decision = decide(&state.config, &payload);
+    let decision = decide(&active_config, &payload);
     let matched_route = decision.route.as_ref().map(|route| route.name.as_str());
     if matches!(decision.source, MatchSource::Fallback) && matched_route.is_some() {
         state
@@ -359,9 +377,10 @@ async fn replay_event(
     if !admin_ok(&state, &headers) {
         return StatusCode::NOT_FOUND.into_response();
     }
+    let active_config = state.runtime_config.read().await.clone();
     match state
         .db
-        .replay(id, body.route.as_deref(), &state.config)
+        .replay(id, body.route.as_deref(), &active_config)
         .await
     {
         Ok(true) => StatusCode::ACCEPTED.into_response(),
@@ -390,7 +409,8 @@ async fn bulk_replay(
     let (Some(status), Some(route)) = (query.status.as_deref(), query.route.as_deref()) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    match state.db.bulk_replay(status, route, &state.config).await {
+    let active_config = state.runtime_config.read().await.clone();
+    match state.db.bulk_replay(status, route, &active_config).await {
         Ok(count) => Json(json!({"requeued": count})).into_response(),
         Err(error) => {
             tracing::error!(error = %error, "bulk replay failed");

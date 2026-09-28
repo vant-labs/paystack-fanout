@@ -168,6 +168,19 @@ input::placeholder { color: var(--text-muted); opacity: .75; }
 .stack-form { display: grid; gap: 8px; }
 .compact-form { border-top: 1px solid var(--border); margin-top: 14px; padding-top: 16px; }
 .detail-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+.config-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; margin-bottom: 18px; }
+.config-list { display: grid; gap: 8px; margin-bottom: 20px; }
+.config-row { border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+.config-row > div { display: grid; gap: 3px; }
+.config-row strong { font-size: 13px; }
+.config-row small { color: var(--text-muted); font-size: 11px; overflow-wrap: anywhere; }
+.config-form { border-top: 1px solid var(--border); padding-top: 18px; }
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.check-label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.check-label input { width: auto; }
+.payload-input { width: 100%; resize: vertical; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface); color: var(--text); padding: 10px; font-family: ui-monospace, monospace; font-size: 12px; }
+.alert-success { color: var(--green); background: var(--green-soft); border: 1px solid color-mix(in srgb, var(--green) 25%, transparent); }
+.alert-info { color: var(--brand); background: var(--blue-soft); border: 1px solid color-mix(in srgb, var(--brand) 25%, transparent); }
 .login-body { display: grid; place-items: center; min-height: 100vh; padding: 20px; background: radial-gradient(circle at top left, var(--blue-soft), var(--bg) 48%); }
 .login-card { width: min(100%, 410px); padding: 40px; background: var(--surface); border: 1px solid var(--border); border-radius: 18px; box-shadow: 0 24px 70px rgba(28, 42, 73, .12); }
 .login-brand { margin-bottom: 54px; }
@@ -184,6 +197,7 @@ input::placeholder { color: var(--text-muted); opacity: .75; }
   .main-content { padding: 34px 28px; }
   .metric-grid { grid-template-columns: repeat(2, 1fr); }
   .content-grid, .detail-grid { grid-template-columns: 1fr; }
+  .config-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 700px) {
   .shell { display: block; }
