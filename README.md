@@ -2,7 +2,33 @@
 
 Maintained by Vant Inc.
 
-## Development setup
+Paystack permits one webhook URL per business account. This service provides a
+single public endpoint for a small set of products, verifies the Paystack
+signature, stores the original request durably, and forwards the same bytes and
+signature to the selected product endpoint. It is intended for one business
+account, not as a hosted multi-customer service.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    P[Paystack] -->|raw POST| I[/in/{source}/]
+    I --> V[HMAC-SHA512 + IP check]
+    V --> D[(Postgres events)]
+    D --> Q[(Postgres deliveries)]
+    Q --> W[Tokio delivery worker]
+    W --> T[Timamu webhook]
+    W --> S[ScreenCrafter webhook]
+    W --> A[Alert webhook]
+    D --> AD[Bearer admin API]
+```
+
+The ingest path does only authentication, JSON field extraction, routing,
+transactional persistence, and acknowledgement. Forwarding never runs inline.
+The destination receives the original body, `Content-Type`, and
+`x-paystack-signature`, plus `X-Fanout-Event-Id` and `X-Fanout-Attempt`.
+
+## Quick start
 
 ```sh
 cp .env.example .env
@@ -11,3 +37,195 @@ git config core.hooksPath .githooks
 cargo test
 ```
 
+Set `FANOUT_CONFIG` and `DATABASE_URL`, then run:
+
+```sh
+cargo run -- --role all
+```
+
+The default listener is `0.0.0.0:8080`. The Paystack URL is
+`https://your-host/in/paystack_main`.
+
+## Configuration
+
+`FANOUT_CONFIG` points to a TOML file. Secret values are never read from that
+file; `secret_env` names the environment variable that holds the value.
+Start from [config.example.toml](config.example.toml).
+
+```toml
+[source.paystack_main]
+provider = "paystack"
+secret_env = "PAYSTACK_SECRET_KEY"
+allowed_ips = ["52.31.139.75", "52.49.173.169", "52.214.14.220"]
+
+[[route]]
+name = "timamu"
+destination_url = "https://api.timamu.app/v1/billing/paystack/webhook"
+match = { metadata_app = "timamu", plan_code_prefix = "PLN_tm", reference_prefix = "tm_" }
+
+[fallback]
+mode = "unrouted"
+```
+
+`allowed_ips = []` disables the allowlist for that source. `TRUST_PROXY=true`
+allows the first address in `X-Forwarded-For` to be checked; otherwise the TCP
+peer address is used. The request body limit is 256 KiB. `RETENTION_DAYS`
+defaults to 90 and only delivered events are pruned.
+
+An alert destination may be enabled with:
+
+```toml
+[alerts]
+webhook_url_env = "ALERT_WEBHOOK_URL"
+```
+
+The service sends a generic JSON body such as `{"text":"..."}`. It never
+puts the event body, customer email, or phone number in logs or alert text.
+
+## Routing rules
+
+The first matching route wins, using this precedence:
+
+1. `data.metadata.app`, or a `data.metadata.custom_fields` item whose
+   `variable_name` is `app` and whose `value` is the application name.
+2. `data.plan.plan_code`, `data.subscription.plan.plan_code`, or `data.plan`
+   when `data.plan` is a string. The configured value is a prefix.
+3. `data.reference`, then `data.subscription_code`, then
+   `data.customer_code` when a reference is absent. The configured value is a
+   prefix.
+
+Within a route, a configured matcher is a candidate for that precedence level;
+the other matchers do not have to be present. This lets a product use a
+metadata tag for one event family and a reference prefix for another.
+
+If no route matches, `fallback.mode = "unrouted"` stores the event without a
+delivery and sends an alert. `fallback.mode = "route:name"` sends it to that
+route, which is useful during rollout.
+
+## How to tag payments
+
+Use one stable convention per product:
+
+- Prefer `metadata.app = "timamu"` or `"screencrafter"`.
+- For Checkout or API flows that already use references, use `tm_...` and
+  `sc_...` prefixes.
+- For subscription products, use plan code prefixes such as `PLN_tm...` and
+  `PLN_sc...`.
+
+The router does not modify a payload or create a new signature. Each product
+continues to verify Paystack's signature itself.
+
+## Paystack event fields
+
+The field list below follows Paystack's public webhook and product examples.
+Payloads are retained as raw bytes, so fields not listed here are preserved.
+
+| Event family | Documented fields used or useful for routing |
+| --- | --- |
+| `charge.success` | `data.reference`, `data.metadata`, `data.plan` |
+| `subscription.create` | `data.subscription_code`, `data.plan`, customer and metadata fields |
+| `subscription.disable` | `data.subscription_code`, `data.plan`, `status` |
+| `subscription.not_renew` | `data.subscription_code`, `data.plan`, `status` |
+| `invoice.create` | `data.invoice_code`, subscription/plan information in the invoice payload |
+| `invoice.update` | `data.invoice_code`, final invoice status, subscription/plan information |
+| `invoice.payment_failed` | `data.invoice_code`, failed invoice status and subscription information |
+| `transfer.success`, `transfer.failed`, `transfer.reversed` | `data.reference`, `data.transfer_code`, `data.status` |
+| `refund.pending`, `refund.processing`, `refund.processed`, `refund.failed` | `data.transaction_reference`, `data.refund_reference`, `data.status` |
+
+Paystack's refund examples use `transaction_reference`, not `reference`. The
+requested routing contract intentionally checks only `reference`,
+`subscription_code`, and `customer_code`, so refund events need
+`metadata.app`, a configured fallback, or a future routing rule. The current
+public examples also vary across event families; the router therefore does not
+deserialize a rigid event struct.
+
+References: [Paystack webhooks](https://paystack.com/docs/payments/webhooks/),
+[subscriptions](https://paystack.com/docs/payments/subscriptions/),
+[charge API](https://paystack.com/docs/api/charge/),
+[transfers](https://paystack.com/docs/transfers/single-transfers/), and
+[refunds](https://paystack.com/docs/payments/refunds/).
+
+## Delivery behavior
+
+The queue uses `FOR UPDATE SKIP LOCKED`, so multiple replicas claim separate
+deliveries. A 2xx response marks an event delivered. Other responses and
+network errors record an attempt and retry after 30s, 2m, 10m, 30m, 1h, 3h,
+6h, 12h, and 24h, with 20% jitter. Attempt 10 is terminal and marks the
+delivery dead. Response bodies are capped at 2 KiB in the attempt record.
+
+The stored event has the raw body, signature, content type, a safe header
+subset, event type, route, status, and receipt time. Invalid signatures return
+401 and are never stored. Duplicate raw bodies for one source return 200 with
+no new delivery.
+
+## Admin and operations
+
+When `ADMIN_TOKEN` is set, send `Authorization: Bearer ...` to:
+
+- `GET /admin/events?status=&route=&type=&since=&limit=&offset=`
+- `GET /admin/events/{id}`
+- `POST /admin/events/{id}/replay` with optional `{"route":"timamu"}`
+- `POST /admin/replay?status=dead&route=timamu`
+
+When the token is unset, admin routes return 404. `/healthz` is liveness,
+`/readyz` checks the database, and `/metrics` exposes Prometheus text metrics
+including received, signature failures, duplicates, deliveries, retries,
+dead events, unrouted events, shadow misses, and a delivery latency histogram.
+
+## Railway deployment
+
+1. Create a Railway project with a Postgres service.
+2. Deploy this repository as a Docker service; `railway.toml` selects the
+   Dockerfile and `/readyz` health check.
+3. Set `DATABASE_URL`, `FANOUT_CONFIG`, `PAYSTACK_SECRET_KEY`, and destination
+   URLs in the Railway environment. Add `ADMIN_TOKEN` and
+   `ALERT_WEBHOOK_URL` only when needed.
+4. Use the service public URL as the Paystack webhook URL in test mode.
+5. Restrict access to admin routes at the network edge as an additional
+   control when possible.
+
+## Rollout guide
+
+1. Deploy and point the Paystack TEST mode webhook at
+   `/in/paystack_main`; verify with test charges.
+2. Set `fallback = "route:screencrafter"` while tagging rolls out. Watch the
+   `fanout_would_unrouted` metric and inspect route data.
+3. Switch the live webhook URL. Keep the ScreenCrafter fallback until
+   unrouted traffic is 0 for seven days, then set `fallback.mode = "unrouted"`.
+
+## Load smoke
+
+Run the local smoke against a running service with a small signed fixture:
+
+```sh
+seq 1 1000 | xargs -I{} -P8 curl -sS -o /dev/null -w '%{http_code}\n' \
+  -X POST http://localhost:8080/in/paystack_main \
+  -H 'content-type: application/json' \
+  -H "x-paystack-signature: $SIGNATURE" \
+  --data-binary @tests/fixtures/charge.success.json
+```
+
+Measure client-side latency with `hey` or `wrk` and keep the database on the
+same machine. The target is p99 below 200ms; record the observed result in
+your deployment notes because it depends on Postgres and disk speed.
+
+Local smoke on 2026-09-28 with Postgres 16 in Docker, the debug binary, and
+eight concurrent clients completed 1,000 unique signed events with p50 8.91ms,
+p95 36.18ms, p99 109.41ms, and max 206.60ms.
+
+## Tests
+
+Unit coverage includes signatures, routing precedence, all listed fixture
+event names, and the retry schedule. With `DATABASE_URL` set, the integration
+suite exercises ingestion, duplicate suppression, forwarding, retry state,
+replay, alert hooks, and concurrent queue claims. The CI workflow starts
+Postgres, runs migrations, then runs formatting, linting, tests, and the Docker
+build.
+
+## Project boundaries
+
+There are no accounts, billing, dashboard pages, or payload re-signing. The
+Provider trait is deliberately small so Flutterwave and Stripe can be added
+later without changing the queue contract; only Paystack is implemented now.
+
+Use conventional commit messages. License: MIT.

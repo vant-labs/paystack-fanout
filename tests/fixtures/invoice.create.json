@@ -1,0 +1,10 @@
+{
+  "event": "invoice.create",
+  "data": {
+    "domain": "test",
+    "invoice_code": "INV_tm_1001",
+    "subscription_code": "SUB_tm_1001",
+    "status": "pending",
+    "plan": {"plan_code": "PLN_tm_monthly"}
+  }
+}

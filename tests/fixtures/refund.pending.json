@@ -1,0 +1,10 @@
+{
+  "event": "refund.pending",
+  "data": {
+    "status": "pending",
+    "transaction_reference": "tm_order_1002",
+    "refund_reference": null,
+    "amount": "10000",
+    "currency": "NGN"
+  }
+}

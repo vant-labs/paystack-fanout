@@ -1,0 +1,8 @@
+.git
+.github
+target
+tests
+*.md
+config.example.toml
+.env*
+

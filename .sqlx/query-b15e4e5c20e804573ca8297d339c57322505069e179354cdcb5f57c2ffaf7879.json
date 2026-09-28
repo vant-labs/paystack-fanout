@@ -1,0 +1,56 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT d.id as delivery_id, d.event_id, d.attempts, e.raw_body, e.content_type, e.signature, d.destination_url\n               FROM deliveries d JOIN events e ON e.id = d.event_id\n               WHERE ((d.status IN ('pending', 'retrying') AND d.next_attempt_at <= now())\n                  OR (d.status = 'delivering' AND d.locked_at < now() - interval '2 minutes'))\n               ORDER BY d.next_attempt_at ASC FOR UPDATE OF d SKIP LOCKED LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "delivery_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "event_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "attempts",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "raw_body",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 4,
+        "name": "content_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "signature",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "destination_url",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "b15e4e5c20e804573ca8297d339c57322505069e179354cdcb5f57c2ffaf7879"
+}

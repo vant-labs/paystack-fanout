@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE deliveries SET status = $2, next_attempt_at = COALESCE($3, next_attempt_at), locked_at = NULL WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5b3062494fc73f506bddb67f7854f634d917431bbbf0ffa795545a3e119a8d52"
+}

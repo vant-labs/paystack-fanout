@@ -1,0 +1,10 @@
+{
+  "event": "invoice.payment_failed",
+  "data": {
+    "domain": "test",
+    "invoice_code": "INV_sc_1002",
+    "subscription_code": "SUB_sc_1002",
+    "status": "failed",
+    "plan": {"plan_code": "PLN_sc_monthly"}
+  }
+}

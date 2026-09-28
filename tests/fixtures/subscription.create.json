@@ -1,0 +1,10 @@
+{
+  "event": "subscription.create",
+  "data": {
+    "domain": "test",
+    "subscription_code": "SUB_tm_1001",
+    "status": "active",
+    "plan": {"plan_code": "PLN_tm_monthly"},
+    "metadata": {"custom_fields": [{"variable_name": "app", "value": "timamu"}]}
+  }
+}

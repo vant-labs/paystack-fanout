@@ -1,0 +1,10 @@
+{
+  "event": "invoice.update",
+  "data": {
+    "domain": "test",
+    "invoice_code": "INV_sc_1001",
+    "subscription_code": "SUB_sc_1001",
+    "status": "success",
+    "plan": {"plan_code": "PLN_sc_monthly"}
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO delivery_attempts (delivery_id, attempt, started_at, finished_at, status_code, latency_ms, response_body)\n               VALUES ($1, $2, $3, $4, $5, $6, $7)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Timestamptz",
+        "Timestamptz",
+        "Int4",
+        "Int4",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f3dafa197c6999e966387e3f973f1cb1b38d33a1b114ae7cb128482e6ead46c8"
+}

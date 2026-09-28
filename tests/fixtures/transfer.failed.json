@@ -1,0 +1,11 @@
+{
+  "event": "transfer.failed",
+  "data": {
+    "domain": "test",
+    "amount": 100000,
+    "currency": "NGN",
+    "reference": "sc_transfer_1001",
+    "transfer_code": "TRF_sc_1001",
+    "status": "failed"
+  }
+}

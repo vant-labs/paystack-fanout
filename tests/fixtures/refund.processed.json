@@ -1,0 +1,10 @@
+{
+  "event": "refund.processed",
+  "data": {
+    "status": "processed",
+    "transaction_reference": "tm_order_1003",
+    "refund_reference": "REF_tm_1003",
+    "amount": "10000",
+    "currency": "NGN"
+  }
+}

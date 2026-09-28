@@ -1,0 +1,13 @@
+{
+  "event": "charge.success",
+  "data": {
+    "id": 53561,
+    "domain": "test",
+    "status": "success",
+    "reference": "tm_order_1001",
+    "amount": 150000,
+    "currency": "NGN",
+    "metadata": {"app": "timamu"},
+    "plan": {"plan_code": "PLN_tm_monthly"}
+  }
+}

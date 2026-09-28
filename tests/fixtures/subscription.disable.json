@@ -1,0 +1,9 @@
+{
+  "event": "subscription.disable",
+  "data": {
+    "domain": "test",
+    "subscription_code": "SUB_sc_1001",
+    "status": "complete",
+    "plan": {"plan_code": "PLN_sc_monthly"}
+  }
+}

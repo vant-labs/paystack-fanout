@@ -1,0 +1,10 @@
+{
+  "event": "refund.failed",
+  "data": {
+    "status": "failed",
+    "transaction_reference": "sc_order_1003",
+    "refund_reference": "REF_sc_1003",
+    "amount": "10000",
+    "currency": "NGN"
+  }
+}

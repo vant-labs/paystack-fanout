@@ -1,0 +1,9 @@
+{
+  "event": "subscription.not_renew",
+  "data": {
+    "domain": "test",
+    "subscription_code": "SUB_sc_1002",
+    "status": "non-renewing",
+    "plan": {"plan_code": "PLN_sc_monthly"}
+  }
+}
