@@ -20,7 +20,14 @@ jobs:
             echo "prohibited text found in tracked files" >&2
             exit 1
           fi
-          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          if [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            base="$(git rev-list --max-parents=0 HEAD)"
+          fi
           if git log --format='%B' "$base..${{ github.sha }}" | grep -Eiq "$pattern"; then
             echo "prohibited text found in commit messages" >&2
             exit 1
@@ -55,7 +62,7 @@ jobs:
           components: clippy
       - run: cargo clippy --all-targets --all-features -- -D warnings
         env:
-          DATABASE_URL: postgres://fanout:fanout@localhost:5432/fanout
+          SQLX_OFFLINE: true
 
   tests:
     runs-on: ubuntu-latest
@@ -75,6 +82,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --all-targets
         env:
+          SQLX_OFFLINE: true
           DATABASE_URL: postgres://fanout:fanout@localhost:5432/fanout
           PAYSTACK_SECRET_KEY: sk_test_ci
 
