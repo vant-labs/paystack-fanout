@@ -136,6 +136,7 @@ jobs:
         run: printf 'long secure password\nlong secure password\n' | ./target/debug/paystack-fanout create-owner --email owner@example.com
         env:
           DATABASE_URL: postgres://fanout:fanout@localhost:5432/fanout
+          PAYSTACK_SECRET_KEY: sk_test_ci
           FANOUT_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
           FANOUT_OWNER_PASSWORD: long secure password
           FANOUT_OWNER_PASSWORD_CONFIRM: long secure password
