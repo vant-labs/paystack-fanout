@@ -288,7 +288,7 @@ async fn healthz() -> impl IntoResponse {
 }
 
 async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match sqlx::query_scalar::<_, i64>("SELECT 1")
+    match sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(&state.db.pool)
         .await
     {
