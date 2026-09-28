@@ -103,6 +103,19 @@ pub struct OverviewStats {
     pub delivered_with_delivery: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthWindow {
+    Hours24,
+    Days7,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthPoint {
+    pub bucket: DateTime<Utc>,
+    pub received: i64,
+    pub delivered: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SourceView {
     pub name: String,
@@ -618,6 +631,56 @@ impl Database {
             total_with_delivery: delivery_row.try_get("total_with_delivery")?,
             delivered_with_delivery: delivery_row.try_get("delivered_with_delivery")?,
         })
+    }
+
+    pub async fn overview_health(&self, window: HealthWindow) -> Result<Vec<HealthPoint>> {
+        let query = match window {
+            HealthWindow::Hours24 => {
+                r#"WITH activity AS (
+                    SELECT date_trunc('hour', received_at) AS bucket, COUNT(*) AS received, 0::bigint AS delivered
+                    FROM events
+                    WHERE received_at >= now() - interval '24 hours'
+                    GROUP BY 1
+                    UNION ALL
+                    SELECT date_trunc('hour', delivered_at) AS bucket, 0::bigint AS received, COUNT(*) AS delivered
+                    FROM events
+                    WHERE status = 'delivered' AND delivered_at >= now() - interval '24 hours'
+                    GROUP BY 1
+                )
+                SELECT bucket, SUM(received)::bigint AS received, SUM(delivered)::bigint AS delivered
+                FROM activity
+                GROUP BY bucket
+                ORDER BY bucket"#
+            }
+            HealthWindow::Days7 => {
+                r#"WITH activity AS (
+                    SELECT date_trunc('day', received_at) AS bucket, COUNT(*) AS received, 0::bigint AS delivered
+                    FROM events
+                    WHERE received_at >= now() - interval '7 days'
+                    GROUP BY 1
+                    UNION ALL
+                    SELECT date_trunc('day', delivered_at) AS bucket, 0::bigint AS received, COUNT(*) AS delivered
+                    FROM events
+                    WHERE status = 'delivered' AND delivered_at >= now() - interval '7 days'
+                    GROUP BY 1
+                )
+                SELECT bucket, SUM(received)::bigint AS received, SUM(delivered)::bigint AS delivered
+                FROM activity
+                GROUP BY bucket
+                ORDER BY bucket"#
+            }
+        };
+        let rows = sqlx::query(query).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(HealthPoint {
+                    bucket: row.try_get("bucket")?,
+                    received: row.try_get("received")?,
+                    delivered: row.try_get("delivered")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(Into::into)
     }
 
     #[allow(clippy::too_many_arguments)]

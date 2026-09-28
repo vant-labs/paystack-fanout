@@ -22,7 +22,7 @@ use crate::{
         session_cookie, session_token, verify_password, verify_totp,
     },
     config::RouteMatcher,
-    db::{AuditEntry, EventDetail, EventSummary, OverviewStats},
+    db::{AuditEntry, EventDetail, EventSummary, HealthPoint, HealthWindow, OverviewStats},
     db::{RouteView, SourceView, UserView},
 };
 
@@ -65,9 +65,41 @@ struct OverviewPage {
     user: SessionUser,
     csrf: String,
     stats: OverviewStats,
+    health: HealthChart,
     signature_failures: u64,
     success_rate: String,
     recent_failures: Vec<EventSummary>,
+}
+
+#[derive(Debug, Clone)]
+struct HealthChart {
+    window_label: &'static str,
+    show_chart: bool,
+    points: Vec<HealthPlotPoint>,
+    received_path: String,
+    delivered_path: String,
+}
+
+#[derive(Debug, Clone)]
+struct HealthPlotPoint {
+    label: String,
+    x: String,
+    received_y: String,
+    delivered_y: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct OverviewQuery {
+    window: Option<String>,
+}
+
+impl OverviewQuery {
+    fn health_window(&self) -> HealthWindow {
+        match self.window.as_deref() {
+            Some("24h") => HealthWindow::Hours24,
+            _ => HealthWindow::Days7,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -345,12 +377,74 @@ async fn logout(
     response
 }
 
-async fn overview(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+fn build_health_chart(points: Vec<HealthPoint>, window: HealthWindow) -> HealthChart {
+    const LEFT: f64 = 18.0;
+    const RIGHT: f64 = 702.0;
+    const TOP: f64 = 20.0;
+    const BOTTOM: f64 = 150.0;
+
+    let maximum = points
+        .iter()
+        .flat_map(|point| [point.received, point.delivered])
+        .max()
+        .unwrap_or(0)
+        .max(1) as f64;
+    let denominator = points.len().saturating_sub(1).max(1) as f64;
+    let plot_points = points
+        .iter()
+        .enumerate()
+        .map(|(index, point)| {
+            let x = LEFT + (index as f64 / denominator) * (RIGHT - LEFT);
+            let received_y = BOTTOM - (point.received as f64 / maximum) * (BOTTOM - TOP);
+            let delivered_y = BOTTOM - (point.delivered as f64 / maximum) * (BOTTOM - TOP);
+            HealthPlotPoint {
+                label: match window {
+                    HealthWindow::Hours24 => point.bucket.format("%H:%M").to_string(),
+                    HealthWindow::Days7 => point.bucket.format("%m-%d").to_string(),
+                },
+                x: format!("{x:.1}"),
+                received_y: format!("{received_y:.1}"),
+                delivered_y: format!("{delivered_y:.1}"),
+            }
+        })
+        .collect::<Vec<_>>();
+    let received_path = plot_points
+        .iter()
+        .map(|point| format!("{},{}", point.x, point.received_y))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let delivered_path = plot_points
+        .iter()
+        .map(|point| format!("{},{}", point.x, point.delivered_y))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    HealthChart {
+        window_label: match window {
+            HealthWindow::Hours24 => "24 hours",
+            HealthWindow::Days7 => "7 days",
+        },
+        show_chart: plot_points.len() >= 2,
+        points: plot_points,
+        received_path,
+        delivered_path,
+    }
+}
+
+async fn overview(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<OverviewQuery>,
+) -> Response {
     let Some(user) = require_user(&state, &headers).await else {
         return Redirect::to("/login").into_response();
     };
     let stats = match state.db.overview_stats().await {
         Ok(stats) => stats,
+        Err(error) => return server_error(error),
+    };
+    let health = match state.db.overview_health(query.health_window()).await {
+        Ok(points) => build_health_chart(points, query.health_window()),
         Err(error) => return server_error(error),
     };
     let recent_failures = match state
@@ -373,6 +467,7 @@ async fn overview(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
         user,
         csrf: current_csrf(&state, &headers).await.unwrap_or_default(),
         stats,
+        health,
         signature_failures: state
             .metrics
             .verified_failed

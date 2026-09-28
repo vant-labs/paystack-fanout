@@ -9,7 +9,7 @@ use paystack_fanout::{
     app::build_router,
     auth::{Role, hash_password},
     config::{Config, FallbackConfig, RouteConfig, RouteMatcher, SourceConfig},
-    db::Database,
+    db::{Database, HealthWindow},
 };
 use serial_test::serial;
 use tower::ServiceExt;
@@ -241,5 +241,53 @@ async fn matcher_and_csv_export_are_available_to_signed_in_users() {
     assert!(
         body.windows(b"charge.success".len())
             .any(|window| window == b"charge.success")
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn overview_health_uses_one_real_postgres_point_and_shows_empty_state() {
+    if !can_run() {
+        return;
+    }
+    let (state, db) = setup().await;
+    sqlx::query("TRUNCATE delivery_attempts, deliveries, events CASCADE")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    db.create_owner(
+        "owner@example.com",
+        &hash_password("long secure password").unwrap(),
+    )
+    .await
+    .unwrap();
+    db.insert_event(
+        "paystack_main",
+        "charge.success",
+        br#"{"event":"charge.success","data":{"reference":"tm_chart_1"}}"#,
+        "application/json",
+        "signature",
+        &serde_json::json!({"content-type":"application/json"}),
+        "overview-health-key",
+        Some("test"),
+        Some("reference_prefix"),
+        "pending",
+        Some("http://localhost/test"),
+    )
+    .await
+    .unwrap();
+
+    let points = db.overview_health(HealthWindow::Hours24).await.unwrap();
+    assert_eq!(points.len(), 1);
+    assert_eq!(points[0].received, 1);
+    assert_eq!(points[0].delivered, 0);
+
+    let (cookie, _) = login(state.clone(), "owner@example.com", "long secure password").await;
+    let response = request(state, "GET", "/admin?window=24h", Some(&cookie), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(
+        body.windows(b"Not enough data yet".len())
+            .any(|window| { window == b"Not enough data yet" })
     );
 }
