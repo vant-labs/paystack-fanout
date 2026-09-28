@@ -39,7 +39,7 @@ git config core.hooksPath .githooks
 cargo test
 ```
 
-Set `DATABASE_URL`, `PAYSTACK_SECRET_KEY`, and `FANOUT_ENCRYPTION_KEY`, then run:
+Set `DATABASE_URL`, `MASTER_ENCRYPTION_KEY`, and `ADMIN_BOOTSTRAP_TOKEN`, then run:
 
 ```sh
 cargo run -- --role all
@@ -48,11 +48,11 @@ cargo run -- --role all
 The listener binds to `0.0.0.0` and uses `PORT`, defaulting to `8080`. The
 Paystack URL is `https://your-host/in/paystack_main`.
 
-For the browser console, set a 32-byte `FANOUT_ENCRYPTION_KEY`, then create the
+For the browser console, set a 32-byte `MASTER_ENCRYPTION_KEY`, then create the
 first owner after migrations run:
 
 ```sh
-export FANOUT_ENCRYPTION_KEY="$(openssl rand -hex 32)"
+export MASTER_ENCRYPTION_KEY="$(openssl rand -hex 32)"
 cargo run -- create-owner --email owner@example.com
 ```
 
@@ -88,7 +88,8 @@ mode = "unrouted"
 `allowed_ips = []` disables the allowlist for that source. `TRUST_PROXY=true`
 allows the first address in `X-Forwarded-For` to be checked; otherwise the TCP
 peer address is used. The request body limit is 256 KiB. `RETENTION_DAYS`
-defaults to 90 and only delivered events are pruned.
+defaults to 90; delivery records are kept for 30 days and delivered event
+records follow the configured retention.
 
 An alert destination may be enabled with:
 
@@ -178,17 +179,34 @@ no new delivery.
 
 ## Admin and operations
 
-When `ADMIN_TOKEN` is set, send `Authorization: Bearer ...` to:
+When `ADMIN_TOKEN` or `ADMIN_BOOTSTRAP_TOKEN` is set, send `Authorization: Bearer ...` to:
 
 - `GET /admin/events?status=&route=&type=&since=&limit=&offset=`
 - `GET /admin/events/{id}`
 - `POST /admin/events/{id}/replay` with optional `{"route":"timamu"}`
 - `POST /admin/replay?status=dead&route=timamu`
+- `GET /admin/routes`, `POST /admin/routes`, `PATCH /admin/routes/{name}`, and
+  `DELETE /admin/routes/{name}`
+- `GET /admin/deliveries?reference=...`
+- `GET /admin/settings`, `PUT /admin/settings/{key}`, and
+  `DELETE /admin/settings/{key}`
+
+For example, add the Timamu route with both matching conventions:
+
+```sh
+curl -X POST "$APP_URL/admin/routes" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"name":"timamu","target_url":"https://api.timamu.app/v1/billing/paystack/webhook","ref_prefix":"tm_","metadata_app":"timamu","enabled":true}'
+```
 
 When the token is unset, admin routes return 404. `/healthz` is liveness,
 `/readyz` checks the database, and `/metrics` exposes Prometheus text metrics
 including received, signature failures, duplicates, deliveries, retries,
 dead events, unrouted events, shadow misses, and a delivery latency histogram.
+
+Swagger UI is available at `/docs` (redirecting to `/docs/`), with the raw
+OpenAPI document at `/api-docs/openapi.json`.
 
 ## Deploy on Railway
 
@@ -198,11 +216,11 @@ dead events, unrouted events, shadow misses, and a delivery latency histogram.
 3. Set these required variables in the service environment:
    - `DATABASE_URL`: reference the Railway Postgres service variable, for
      example `${{Postgres.DATABASE_URL}}`.
-   - `PAYSTACK_SECRET_KEY`: the Paystack secret key for the selected mode.
-   - `FANOUT_ENCRYPTION_KEY`: create one with `openssl rand -hex 32`.
+   - `MASTER_ENCRYPTION_KEY`: create one with `openssl rand -hex 32`.
+   - `ADMIN_BOOTSTRAP_TOKEN`: a one-time token for creating the first admin.
 4. In Railway service settings, set the health check path to `/readyz`.
-5. Run `paystack-fanout create-owner --email you@example.com` after the first
-   deploy, then enable 2FA.
+5. Run `POST /admin/bootstrap` with the bootstrap bearer token and your email
+   and password after the first deploy, then enable 2FA.
 6. Use the service public URL as the Paystack webhook URL in test mode.
 7. Add routes and sources from the dashboard; do not deploy a production route
    file.
@@ -229,13 +247,16 @@ Pages are available after signing in:
 - `/dashboard/config` persisted sources, routes, encrypted write-only secrets, and matcher tests.
 - `/dashboard/users`, `/dashboard/audit`, and `/dashboard/settings` for access and policy.
 
-| Role | Read | Replay/retry | Edit routes and export | Manage users and sources |
-| --- | --- | --- | --- | --- |
-| Viewer | Yes | No | No | No |
-| Admin | Yes | Yes | Yes | No |
-| Owner | Yes | Yes | Yes | Yes |
+| Role | Read | Replay/retry | Edit routes and export | Manage users | Manage sources/secrets |
+| --- | --- | --- | --- | --- | --- |
+| Viewer | Yes | No | No | No | No |
+| Admin | Yes | Yes | Yes | Yes | No |
+| Owner | Yes | Yes | Yes | Yes | Yes |
 
 The JSON admin API remains available with `Authorization: Bearer $ADMIN_TOKEN`.
+The dashboard is available at `/admin`; all application secrets can be stored
+from the settings page or the settings API. Environment values override database
+values, while database values are encrypted with `MASTER_ENCRYPTION_KEY`.
 Browser sessions use an HttpOnly, SameSite=Lax cookie, rotate on sign-in, and
 require a session-bound CSRF value on every mutating form. Passwords use
 Argon2id. Login attempts are rate limited per account, and an optional TOTP

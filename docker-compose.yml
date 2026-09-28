@@ -23,8 +23,9 @@ services:
     environment:
       DATABASE_URL: postgres://fanout:fanout@postgres:5432/fanout
       FANOUT_CONFIG: /etc/fanout/config.toml
+      MASTER_ENCRYPTION_KEY: ${MASTER_ENCRYPTION_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+      ADMIN_BOOTSTRAP_TOKEN: ${ADMIN_BOOTSTRAP_TOKEN:-local-bootstrap-token}
       PAYSTACK_SECRET_KEY: ${PAYSTACK_SECRET_KEY:-sk_test_replace_me}
-      FANOUT_ENCRYPTION_KEY: ${FANOUT_ENCRYPTION_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
       COOKIE_SECURE: "false"
     ports:
       - "8080:8080"

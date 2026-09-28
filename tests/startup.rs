@@ -26,11 +26,11 @@ async fn boots_without_config_and_uses_port_environment_variable() {
         .args(["--role", "ingest"])
         .env("DATABASE_URL", database_url)
         .env_remove("FANOUT_CONFIG")
-        .env("PAYSTACK_SECRET_KEY", "sk_test_startup")
         .env(
-            "FANOUT_ENCRYPTION_KEY",
+            "MASTER_ENCRYPTION_KEY",
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         )
+        .env("ADMIN_BOOTSTRAP_TOKEN", "bootstrap-startup")
         .env("PORT", port.to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

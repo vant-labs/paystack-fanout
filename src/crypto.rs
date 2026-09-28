@@ -3,8 +3,9 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use rand::random;
 
 fn key_from_env() -> anyhow::Result<[u8; 32]> {
-    let value = std::env::var("FANOUT_ENCRYPTION_KEY")
-        .map_err(|_| anyhow::anyhow!("FANOUT_ENCRYPTION_KEY is required"))?;
+    let value = std::env::var("MASTER_ENCRYPTION_KEY")
+        .or_else(|_| std::env::var("FANOUT_ENCRYPTION_KEY"))
+        .map_err(|_| anyhow::anyhow!("MASTER_ENCRYPTION_KEY is required"))?;
     let bytes = hex::decode(&value)
         .ok()
         .filter(|bytes| bytes.len() == 32)
@@ -15,7 +16,7 @@ fn key_from_env() -> anyhow::Result<[u8; 32]> {
                 .filter(|bytes| bytes.len() == 32)
         })
         .ok_or_else(|| {
-            anyhow::anyhow!("FANOUT_ENCRYPTION_KEY must be 32 bytes in hex or base64")
+            anyhow::anyhow!("MASTER_ENCRYPTION_KEY must be 32 bytes in hex or base64")
         })?;
     bytes
         .try_into()

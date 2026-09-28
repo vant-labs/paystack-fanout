@@ -179,6 +179,8 @@ input::placeholder { color: var(--text-muted); opacity: .75; }
 .config-list { display: grid; gap: 8px; margin-bottom: 20px; }
 .config-row { border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
 .config-row > div { display: grid; gap: 3px; }
+.row-actions { display: flex !important; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.row-actions form { display: contents; }
 .config-row strong { font-size: 13px; }
 .config-row small { color: var(--text-muted); font-size: 11px; overflow-wrap: anywhere; }
 .config-form { border-top: 1px solid var(--border); padding-top: 18px; }

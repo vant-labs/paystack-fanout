@@ -41,6 +41,10 @@ impl Role {
     pub fn can_manage(self) -> bool {
         matches!(self, Self::Owner)
     }
+
+    pub fn can_manage_users(self) -> bool {
+        matches!(self, Self::Owner | Self::Admin)
+    }
 }
 
 impl fmt::Display for Role {

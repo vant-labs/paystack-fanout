@@ -159,6 +159,55 @@ async fn viewer_cannot_replay() {
 
 #[tokio::test]
 #[serial]
+async fn admin_can_manage_users() {
+    if !can_run() {
+        return;
+    }
+    let (state, db) = setup().await;
+    db.create_owner(
+        "owner@example.com",
+        &hash_password("long secure password").unwrap(),
+    )
+    .await
+    .unwrap();
+    db.create_user(
+        "admin@example.com",
+        &hash_password("long secure password").unwrap(),
+        Role::Admin,
+    )
+    .await
+    .unwrap();
+    let (cookie, csrf) = login(state.clone(), "admin@example.com", "long secure password").await;
+    let page = request(
+        state.clone(),
+        "GET",
+        "/dashboard/users",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(page.status(), StatusCode::OK);
+    let response = request(
+        state.clone(),
+        "POST",
+        "/dashboard/users/create",
+        Some(&cookie),
+        Some(&format!(
+            "csrf={csrf}&email=viewer-created@example.com&password=long secure password&role=viewer"
+        )),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(
+        db.find_user_by_email("viewer-created@example.com")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn repeated_bad_logins_are_limited() {
     if !can_run() {
         return;
@@ -241,6 +290,35 @@ async fn matcher_and_csv_export_are_available_to_signed_in_users() {
     assert!(
         body.windows(b"charge.success".len())
             .any(|window| window == b"charge.success")
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn swagger_docs_are_available_at_docs() {
+    if !can_run() {
+        return;
+    }
+    let (state, _) = setup().await;
+    let ui = request(state.clone(), "GET", "/docs", None, None).await;
+    assert_eq!(ui.status(), StatusCode::SEE_OTHER);
+    assert_eq!(ui.headers().get("location").unwrap(), "/docs/");
+    let ui = request(state.clone(), "GET", "/docs/", None, None).await;
+    assert_eq!(ui.status(), StatusCode::OK);
+    let ui_body = to_bytes(ui.into_body(), usize::MAX).await.unwrap();
+    assert!(
+        ui_body
+            .windows(b"Swagger UI".len())
+            .any(|window| window == b"Swagger UI")
+    );
+
+    let spec = request(state, "GET", "/api-docs/openapi.json", None, None).await;
+    assert_eq!(spec.status(), StatusCode::OK);
+    let spec_body = to_bytes(spec.into_body(), usize::MAX).await.unwrap();
+    assert!(
+        spec_body
+            .windows(b"/admin/events".len())
+            .any(|window| window == b"/admin/events")
     );
 }
 
