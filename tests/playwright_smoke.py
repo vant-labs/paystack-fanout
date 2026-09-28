@@ -11,7 +11,7 @@ with sync_playwright() as playwright:
     expect(page).to_have_url("http://127.0.0.1:8080/admin")
 
     page.goto("http://127.0.0.1:8080/dashboard/events?status=pending")
-    expect(page.get_by_text("Event ledger")).to_be_visible()
+    expect(page.get_by_role("heading", name="Event ledger")).to_be_visible()
     event_link = page.locator("a.event-id").first
     if event_link.count():
         event_link.click()
