@@ -7,6 +7,7 @@ pub mod crypto;
 pub mod dashboard;
 pub mod db;
 pub mod metrics;
+pub mod openapi;
 pub mod provider;
 pub mod routing;
 pub mod security;

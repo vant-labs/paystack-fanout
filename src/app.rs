@@ -17,6 +17,8 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::{Duration, sleep};
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
 use crate::{
@@ -113,6 +115,10 @@ impl AppState {
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .merge(crate::dashboard::router())
+        .merge(
+            SwaggerUi::new("/docs")
+                .url("/api-docs/openapi.json", crate::openapi::ApiDoc::openapi()),
+        )
         .route("/in/{source}", post(ingest))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -125,7 +131,21 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 }
 
 #[axum::debug_handler]
-async fn ingest(
+#[utoipa::path(
+    post,
+    path = "/in/{source}",
+    params(("source" = String, Path, description = "Configured source name")),
+    request_body(content_type = "application/json", content = Value),
+    responses(
+        (status = 200, description = "Webhook accepted for durable processing"),
+        (status = 400, description = "Verified body was not valid JSON"),
+        (status = 401, description = "Signature verification failed"),
+        (status = 403, description = "Source IP is not allowed"),
+        (status = 404, description = "Source was not found")
+    ),
+    tag = "Webhook"
+)]
+pub(crate) async fn ingest(
     State(state): State<Arc<AppState>>,
     Path(source): Path<String>,
     headers: HeaderMap,
@@ -283,11 +303,26 @@ fn allowed_ip(
     ip.is_some_and(|ip| allowed.contains(&ip))
 }
 
-async fn healthz() -> impl IntoResponse {
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    responses((status = 200, description = "Process is alive")),
+    tag = "Operations"
+)]
+pub(crate) async fn healthz() -> impl IntoResponse {
     StatusCode::OK
 }
 
-async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+#[utoipa::path(
+    get,
+    path = "/readyz",
+    responses(
+        (status = 200, description = "Database is reachable"),
+        (status = 503, description = "Database is unavailable")
+    ),
+    tag = "Operations"
+)]
+pub(crate) async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(&state.db.pool)
         .await
@@ -300,7 +335,13 @@ async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }
 }
 
-async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+#[utoipa::path(
+    get,
+    path = "/metrics",
+    responses((status = 200, description = "Prometheus metrics", content_type = "text/plain")),
+    tag = "Operations"
+)]
+pub(crate) async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4".to_owned())],
         state.metrics.render(),
@@ -308,7 +349,7 @@ async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct EventQuery {
+pub(crate) struct EventQuery {
     status: Option<String>,
     route: Option<String>,
     r#type: Option<String>,
@@ -317,7 +358,22 @@ struct EventQuery {
     offset: Option<i64>,
 }
 
-async fn list_events(
+#[utoipa::path(
+    get,
+    path = "/admin/events",
+    params(
+        ("status" = Option<String>, Query, description = "Event status filter"),
+        ("route" = Option<String>, Query, description = "Matched route filter"),
+        ("type" = Option<String>, Query, description = "Paystack event type filter"),
+        ("since" = Option<String>, Query, description = "RFC3339 lower bound"),
+        ("limit" = Option<i64>, Query, description = "Page size from 1 to 100"),
+        ("offset" = Option<i64>, Query, description = "Number of rows to skip")
+    ),
+    responses((status = 200, description = "Matching events", body = Value)),
+    security(("admin_bearer" = [])),
+    tag = "Admin API"
+)]
+pub(crate) async fn list_events(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<EventQuery>,
@@ -354,7 +410,18 @@ async fn list_events(
     }
 }
 
-async fn get_event(
+#[utoipa::path(
+    get,
+    path = "/admin/events/{id}",
+    params(("id" = Uuid, Path, description = "Event identifier")),
+    responses(
+        (status = 200, description = "Event detail", body = crate::db::EventDetail),
+        (status = 404, description = "Event was not found")
+    ),
+    security(("admin_bearer" = [])),
+    tag = "Admin API"
+)]
+pub(crate) async fn get_event(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
@@ -372,12 +439,24 @@ async fn get_event(
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ReplayBody {
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub(crate) struct ReplayBody {
     route: Option<String>,
 }
 
-async fn replay_event(
+#[utoipa::path(
+    post,
+    path = "/admin/events/{id}/replay",
+    params(("id" = Uuid, Path, description = "Event identifier")),
+    request_body = ReplayBody,
+    responses(
+        (status = 202, description = "Event requeued"),
+        (status = 404, description = "Event was not found")
+    ),
+    security(("admin_bearer" = [])),
+    tag = "Admin API"
+)]
+pub(crate) async fn replay_event(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
@@ -402,12 +481,23 @@ async fn replay_event(
 }
 
 #[derive(Debug, Deserialize)]
-struct BulkReplayQuery {
+pub(crate) struct BulkReplayQuery {
     status: Option<String>,
     route: Option<String>,
 }
 
-async fn bulk_replay(
+#[utoipa::path(
+    post,
+    path = "/admin/replay",
+    params(
+        ("status" = String, Query, description = "Status to replay"),
+        ("route" = String, Query, description = "Destination route name")
+    ),
+    responses((status = 200, description = "Number of events requeued", body = Value)),
+    security(("admin_bearer" = [])),
+    tag = "Admin API"
+)]
+pub(crate) async fn bulk_replay(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<BulkReplayQuery>,

@@ -246,6 +246,35 @@ async fn matcher_and_csv_export_are_available_to_signed_in_users() {
 
 #[tokio::test]
 #[serial]
+async fn swagger_docs_are_available_at_docs() {
+    if !can_run() {
+        return;
+    }
+    let (state, _) = setup().await;
+    let ui = request(state.clone(), "GET", "/docs", None, None).await;
+    assert_eq!(ui.status(), StatusCode::SEE_OTHER);
+    assert_eq!(ui.headers().get("location").unwrap(), "/docs/");
+    let ui = request(state.clone(), "GET", "/docs/", None, None).await;
+    assert_eq!(ui.status(), StatusCode::OK);
+    let ui_body = to_bytes(ui.into_body(), usize::MAX).await.unwrap();
+    assert!(
+        ui_body
+            .windows(b"Swagger UI".len())
+            .any(|window| window == b"Swagger UI")
+    );
+
+    let spec = request(state, "GET", "/api-docs/openapi.json", None, None).await;
+    assert_eq!(spec.status(), StatusCode::OK);
+    let spec_body = to_bytes(spec.into_body(), usize::MAX).await.unwrap();
+    assert!(
+        spec_body
+            .windows(b"/admin/events".len())
+            .any(|window| window == b"/admin/events")
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn overview_health_uses_one_real_postgres_point_and_shows_empty_state() {
     if !can_run() {
         return;

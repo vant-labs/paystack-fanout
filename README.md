@@ -190,6 +190,9 @@ When the token is unset, admin routes return 404. `/healthz` is liveness,
 including received, signature failures, duplicates, deliveries, retries,
 dead events, unrouted events, shadow misses, and a delivery latency histogram.
 
+Swagger UI is available at `/docs` (redirecting to `/docs/`), with the raw
+OpenAPI document at `/api-docs/openapi.json`.
+
 ## Deploy on Railway
 
 1. Create a Railway project with a Postgres service.

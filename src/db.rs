@@ -6,6 +6,7 @@ use futures_util::Stream;
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::auth::{Role, SessionUser, token_hash};
@@ -28,7 +29,7 @@ pub struct ClaimedDelivery {
     pub destination_url: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct EventSummary {
     pub id: Uuid,
     pub source: String,
@@ -39,7 +40,7 @@ pub struct EventSummary {
     pub delivered_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct AttemptView {
     pub attempt: i32,
     pub started_at: DateTime<Utc>,
@@ -50,7 +51,7 @@ pub struct AttemptView {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct EventDetail {
     pub summary: EventSummary,
     pub raw_body: String,
