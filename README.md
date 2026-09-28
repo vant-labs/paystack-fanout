@@ -21,6 +21,8 @@ flowchart LR
     W --> S[ScreenCrafter webhook]
     W --> A[Alert webhook]
     D --> AD[Bearer admin API]
+    B[Browser console] --> H[Cookie session + CSRF]
+    H --> AD
 ```
 
 The ingest path does only authentication, JSON field extraction, routing,
@@ -45,6 +47,18 @@ cargo run -- --role all
 
 The default listener is `0.0.0.0:8080`. The Paystack URL is
 `https://your-host/in/paystack_main`.
+
+For the browser console, set a 32-byte `FANOUT_ENCRYPTION_KEY`, then create the
+first owner after migrations run:
+
+```sh
+export FANOUT_ENCRYPTION_KEY="$(openssl rand -hex 32)"
+cargo run -- create-owner --email owner@example.com
+```
+
+The command prompts twice and never installs default credentials. Open
+`/login` to use the console. Set `COOKIE_SECURE=false` only for local HTTP
+development; production keeps secure cookies enabled by default.
 
 ## Configuration
 
@@ -189,7 +203,44 @@ dead events, unrouted events, shadow misses, and a delivery latency histogram.
 1. Deploy and point the Paystack TEST mode webhook at
    `/in/paystack_main`; verify with test charges.
 2. Set `fallback = "route:screencrafter"` while tagging rolls out. Watch the
-   `fanout_would_unrouted` metric and inspect route data.
+`fanout_would_unrouted` metric and inspect route data.
+
+## Browser console
+
+The built-in console is server-rendered and ships inside the same binary. It
+uses Askama templates, a vendored htmx asset, and a small local stylesheet; no
+runtime asset host or separate frontend service is required.
+
+Pages are available after signing in:
+
+- `/admin` overview with 24-hour and seven-day queue health.
+- `/dashboard/events` filtered event ledger and streamed CSV or newline JSON exports.
+- `/dashboard/events/{id}` raw payload, masked headers, routing decision, and attempts.
+- `/dashboard/retries` and `/dashboard/unrouted` operational queues.
+- `/dashboard/config` persisted sources, routes, encrypted write-only secrets, and matcher tests.
+- `/dashboard/users`, `/dashboard/audit`, and `/dashboard/settings` for access and policy.
+
+| Role | Read | Replay/retry | Edit routes and export | Manage users and sources |
+| --- | --- | --- | --- | --- |
+| Viewer | Yes | No | No | No |
+| Admin | Yes | Yes | Yes | No |
+| Owner | Yes | Yes | Yes | Yes |
+
+The JSON admin API remains available with `Authorization: Bearer $ADMIN_TOKEN`.
+Browser sessions use an HttpOnly, SameSite=Lax cookie, rotate on sign-in, and
+require a session-bound CSRF value on every mutating form. Passwords use
+Argon2id. Login attempts are rate limited per account, and an optional TOTP
+code is checked when a user has one configured.
+
+### Screenshots
+
+Light mode:
+
+![Fanout console overview in light mode](docs/screenshots/dashboard-light.png)
+
+Dark mode:
+
+![Fanout console overview in dark mode](docs/screenshots/dashboard-dark.png)
 3. Switch the live webhook URL. Keep the ScreenCrafter fallback until
    unrouted traffic is 0 for seven days, then set `fallback.mode = "unrouted"`.
 
@@ -224,7 +275,7 @@ build.
 
 ## Project boundaries
 
-There are no accounts, billing, dashboard pages, or payload re-signing. The
+There is no billing, hosted multi-customer mode, or payload re-signing. The
 Provider trait is deliberately small so Flutterwave and Stripe can be added
 later without changing the queue contract; only Paystack is implemented now.
 

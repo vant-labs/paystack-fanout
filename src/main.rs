@@ -30,7 +30,7 @@ struct Args {
     )]
     config: String,
     #[arg(long, global = true, env = "DATABASE_URL")]
-    database_url: String,
+    database_url: Option<String>,
     #[arg(long, global = true, env = "PORT", default_value_t = 8080)]
     port: u16,
     #[arg(long, global = true, value_enum, default_value_t = Role::All)]
@@ -52,7 +52,11 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
     let args = Args::parse();
-    let db = Database::connect(&args.database_url).await?;
+    let database_url = args
+        .database_url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("DATABASE_URL or --database-url is required"))?;
+    let db = Database::connect(database_url).await?;
     db.migrate().await?;
     if let Some(Command::CreateOwner { email }) = args.command {
         anyhow::ensure!(db.user_count().await? == 0, "an owner already exists");

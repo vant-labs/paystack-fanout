@@ -96,3 +96,44 @@ jobs:
           context: .
           push: false
           tags: paystack-fanout:ci
+
+  dashboard-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Start local database
+        run: docker compose up -d postgres
+      - name: Build service
+        run: cargo build
+        env:
+          SQLX_OFFLINE: true
+      - name: Create owner
+        run: printf 'long secure password\nlong secure password\n' | ./target/debug/paystack-fanout create-owner --email owner@example.com
+        env:
+          DATABASE_URL: postgres://fanout:fanout@localhost:5432/fanout
+          FANOUT_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      - name: Start service
+        run: ./target/debug/paystack-fanout --role all --port 8080 &
+        env:
+          DATABASE_URL: postgres://fanout:fanout@localhost:5432/fanout
+          FANOUT_CONFIG: config.example.toml
+          PAYSTACK_SECRET_KEY: sk_test_ci
+          FANOUT_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          COOKIE_SECURE: false
+      - name: Wait for readiness
+        run: timeout 60 bash -c 'until curl -fsS http://127.0.0.1:8080/readyz; do sleep 1; done'
+      - name: Seed browser event
+        run: |
+          python3 - <<'PY'
+          import hashlib, hmac, json, urllib.request
+          body = json.dumps({"event": "charge.success", "data": {"reference": "tm_smoke_1", "metadata": {"app": "timamu"}}}).encode()
+          signature = hmac.new(b"sk_test_ci", body, hashlib.sha512).hexdigest()
+          request = urllib.request.Request("http://127.0.0.1:8080/in/paystack_main", data=body, method="POST", headers={"content-type": "application/json", "x-paystack-signature": signature})
+          with urllib.request.urlopen(request) as response:
+              assert response.status == 200
+          PY
+      - name: Install browser test dependencies
+        run: python3 -m pip install playwright && python3 -m playwright install --with-deps chromium
+      - name: Run browser smoke
+        run: python3 tests/playwright_smoke.py

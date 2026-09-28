@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use axum::{
-    body::Body,
+    body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
 use paystack_fanout::{
@@ -190,4 +190,56 @@ async fn repeated_bad_logins_are_limited() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+#[serial]
+async fn matcher_and_csv_export_are_available_to_signed_in_users() {
+    if !can_run() {
+        return;
+    }
+    let (state, db) = setup().await;
+    db.create_owner(
+        "owner@example.com",
+        &hash_password("long secure password").unwrap(),
+    )
+    .await
+    .unwrap();
+    db.insert_event(
+        "paystack_main",
+        "charge.success",
+        br#"{"event":"charge.success","data":{"metadata":{"app":"test"}}}"#,
+        "application/json",
+        "signature",
+        &serde_json::json!({"content-type":"application/json"}),
+        "dashboard-export-key",
+        Some("test"),
+        Some("metadata.app"),
+        "pending",
+        Some("http://localhost/test"),
+    )
+    .await
+    .unwrap();
+    let (cookie, csrf) = login(state.clone(), "owner@example.com", "long secure password").await;
+    let test_response = request(state.clone(), "POST", "/dashboard/config/test-route", Some(&cookie), Some(&format!("csrf={csrf}&route=test&payload=%7B%22data%22%3A%7B%22metadata%22%3A%7B%22app%22%3A%22test%22%7D%7D%7D"))).await;
+    assert_eq!(test_response.status(), StatusCode::OK);
+    let export = request(
+        state,
+        "GET",
+        "/dashboard/events/export.csv",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(export.status(), StatusCode::OK);
+    assert_eq!(
+        export.headers().get("content-type").unwrap(),
+        "text/csv; charset=utf-8"
+    );
+    let body = to_bytes(export.into_body(), usize::MAX).await.unwrap();
+    assert!(body.starts_with(b"id,source,event_type"));
+    assert!(
+        body.windows(b"charge.success".len())
+            .any(|window| window == b"charge.success")
+    );
 }

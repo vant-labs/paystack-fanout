@@ -15,6 +15,21 @@ services:
       timeout: 3s
       retries: 15
 
+  app:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://fanout:fanout@postgres:5432/fanout
+      FANOUT_CONFIG: /etc/fanout/config.toml
+      PAYSTACK_SECRET_KEY: ${PAYSTACK_SECRET_KEY:-sk_test_replace_me}
+      FANOUT_ENCRYPTION_KEY: ${FANOUT_ENCRYPTION_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+      COOKIE_SECURE: "false"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.example.toml:/etc/fanout/config.toml:ro
+
 volumes:
   fanout-postgres:
-

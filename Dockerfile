@@ -4,6 +4,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY .sqlx ./.sqlx
 COPY migrations ./migrations
 COPY src ./src
+COPY static ./static
+COPY templates ./templates
 ENV SQLX_OFFLINE=true
 RUN cargo build --release
 
@@ -13,4 +15,3 @@ COPY --from=builder /build/target/release/paystack-fanout /usr/local/bin/paystac
 USER fanout
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/paystack-fanout"]
-
