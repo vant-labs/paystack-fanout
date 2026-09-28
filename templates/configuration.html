@@ -1,9 +1,56 @@
 {% extends "base.html" %}
 {% block title %}Sources &amp; routes · Fanout{% endblock %}
 {% block content %}
-<header class="page-header"><div><div class="eyebrow">Configuration</div><h1>Sources &amp; routes</h1><p class="muted">Persisted in Postgres and applied to new webhook decisions.</p></div><div class="header-actions"><span class="panel-kicker">Secrets are write-only</span></div></header>
-{% if let Some(message) = message %}<div class="alert alert-success" role="status">{{ message }}</div>{% endif %}{% if let Some(error) = error %}<div class="alert alert-error" role="alert">{{ error }}</div>{% endif %}{% if let Some(result) = test_result %}<div class="alert alert-info" role="status">{{ result }}</div>{% endif %}
-<section class="config-grid"><article class="panel"><div class="panel-heading"><div><h2>Sources</h2><p class="muted">Webhook providers and encrypted credentials.</p></div></div>{% if sources.is_empty() %}<div class="empty-state compact"><h3>No database sources yet</h3><p>Set the encryption key and restart to seed from TOML.</p></div>{% else %}<div class="config-list">{% for source in sources %}<div class="config-row"><div><strong>{{ source.name }}</strong><small>{{ source.provider }} · {% if source.enabled %}enabled{% else %}disabled{% endif %} · {% if source.secret_present %}secret stored{% else %}secret missing{% endif %}</small><small>Allowed IPs: {% if source.allowed_ips.is_empty() %}any{% else %}{{ source.allowed_ips|join(", ") }}{% endif %}</small></div></div>{% endfor %}</div>{% endif %}{% if user.role.can_manage() %}<form method="post" action="/dashboard/config/source" class="stack-form config-form"><input type="hidden" name="csrf" value="{{ csrf }}"><h3>Add or edit source</h3><label for="source-name">Name</label><input id="source-name" name="name" placeholder="paystack_main" required><label for="provider">Provider</label><input id="provider" name="provider" value="paystack" required><label for="secret">Secret <span class="muted">leave blank to keep the stored value</span></label><input id="secret" name="secret" type="password" autocomplete="new-password"><label for="allowed_ips">Allowed IPs <span class="muted">comma separated</span></label><input id="allowed_ips" name="allowed_ips" placeholder="52.31.139.75, 52.49.173.169"><label class="check-label"><input type="checkbox" name="enabled" checked> Enabled</label><button class="button button-primary" type="submit">Save source</button></form>{% endif %}</article>
-<article class="panel"><div class="panel-heading"><div><h2>Routes</h2><p class="muted">The first matching rule wins.</p></div></div>{% if routes.is_empty() %}<div class="empty-state compact"><h3>No database routes yet</h3><p>Set the encryption key and restart to seed from TOML.</p></div>{% else %}<div class="config-list">{% for route in routes %}<div class="config-row"><div><strong>{{ route.name }}</strong><small>{{ route.destination_url }} · {% if route.enabled %}enabled{% else %}disabled{% endif %}</small><small>{% if let Some(value) = route.matcher.metadata_app %}metadata.app={{ value }} {% endif %}{% if let Some(value) = route.matcher.plan_code_prefix %}plan={{ value }} {% endif %}{% if let Some(value) = route.matcher.reference_prefix %}reference={{ value }}{% endif %}</small></div></div>{% endfor %}</div>{% endif %}<form method="post" action="/dashboard/config/route" class="stack-form config-form"><input type="hidden" name="csrf" value="{{ csrf }}"><h3>Add or edit route</h3><label for="route-name">Name</label><input id="route-name" name="name" placeholder="timamu" required><label for="destination_url">Destination URL</label><input id="destination_url" name="destination_url" type="url" placeholder="https://api.example.com/webhook" required><label for="metadata_app">Metadata app</label><input id="metadata_app" name="metadata_app" placeholder="timamu"><label for="plan_code_prefix">Plan code prefix</label><input id="plan_code_prefix" name="plan_code_prefix" placeholder="PLN_tm"><label for="reference_prefix">Reference prefix</label><input id="reference_prefix" name="reference_prefix" placeholder="tm_"><div class="two-col"><div><label for="timeout_seconds">Timeout seconds</label><input id="timeout_seconds" name="timeout_seconds" type="number" min="1" max="60" value="10"></div><div><label for="max_attempts">Max attempts</label><input id="max_attempts" name="max_attempts" type="number" min="1" max="10" value="10"></div></div><label class="check-label"><input type="checkbox" name="enabled" checked> Enabled</label><button class="button button-primary" type="submit">Save route</button></form></article></section>
-<section class="panel"><div class="panel-heading"><div><h2>Test the matcher</h2><p class="muted">Paste a payload to verify a routing decision. Nothing is forwarded.</p></div></div><form method="post" action="/dashboard/config/test-route" class="stack-form"><input type="hidden" name="csrf" value="{{ csrf }}"><div class="two-col"><div><label for="test-route">Expected route</label><select id="test-route" name="route">{% for route in routes %}<option value="{{ route.name }}">{{ route.name }}</option>{% endfor %}</select></div><div></div></div><label for="payload">Payload</label><textarea id="payload" name="payload" class="payload-input" rows="7">{"event":"charge.success","data":{"metadata":{"app":"timamu"}}}</textarea><button class="button button-secondary" type="submit">Test route</button></form></section>
+<header class="page-header">
+    <div><div class="eyebrow">Configuration</div><h1>Sources &amp; routes</h1><p class="muted">Persisted in Postgres and applied to new webhook decisions.</p></div>
+    <div class="header-actions"><span class="panel-kicker">Secrets are write-only</span></div>
+</header>
+{% if let Some(message) = message %}<div class="alert alert-success" role="status">{{ message }}</div>{% endif %}
+{% if let Some(error) = error %}<div class="alert alert-error" role="alert">{{ error }}</div>{% endif %}
+{% if let Some(result) = test_result %}<div class="alert alert-info" role="status">{{ result }}</div>{% endif %}
+<section class="config-grid">
+    <article class="panel">
+        <div class="panel-heading"><div><h2>Sources</h2><p class="muted">Webhook providers and encrypted credentials.</p></div></div>
+        {% if sources.is_empty() %}<div class="empty-state compact"><h3>No database sources yet</h3><p>Set the encryption key and restart to seed from TOML.</p></div>
+        {% else %}
+        <div class="config-list">
+            {% for source in sources %}<div class="config-row"><div><strong>{{ source.name }}</strong><small>{{ source.provider }} · {% if source.enabled %}enabled{% else %}disabled{% endif %} · {% if source.secret_present %}secret stored{% else %}secret missing{% endif %}</small><small>Allowed IPs: {% if source.allowed_ips.is_empty() %}any{% else %}{{ source.allowed_ips|join(", ") }}{% endif %}</small></div></div>{% endfor %}
+        </div>
+        {% endif %}
+        {% if user.role.can_manage() %}
+        <form method="post" action="/dashboard/config/source" class="stack-form config-form">
+            <input type="hidden" name="csrf" value="{{ csrf }}"><h3>Add or edit source</h3><label for="source-name">Name</label><input id="source-name" name="name" placeholder="paystack_main" required><label for="provider">Provider</label><input id="provider" name="provider" value="paystack" required><label for="secret">Secret <span class="muted">leave blank to keep the stored value</span></label><input id="secret" name="secret" type="password" autocomplete="new-password"><label for="allowed_ips">Allowed IPs <span class="muted">comma separated</span></label><input id="allowed_ips" name="allowed_ips" placeholder="52.31.139.75, 52.49.173.169"><label class="check-label"><input type="checkbox" name="enabled" checked> Enabled</label><button class="button button-primary" type="submit">Save source</button>
+        </form>
+        {% endif %}
+    </article>
+    <article class="panel">
+        <div class="panel-heading"><div><h2>Routes</h2><p class="muted">The first matching rule wins.</p></div></div>
+        {% if routes.is_empty() %}<div class="empty-state compact"><h3>No database routes yet</h3><p>Create a route below to start forwarding events.</p></div>
+        {% else %}
+        <div class="config-list">
+            {% for route in routes %}
+            <div class="config-row">
+                <div><strong>{{ route.name }}</strong><small>{{ route.destination_url }} · {% if route.enabled %}enabled{% else %}disabled{% endif %}</small><small>{% if let Some(value) = route.matcher.metadata_app %}metadata.app={{ value }} {% endif %}{% if let Some(value) = route.matcher.plan_code_prefix %}plan={{ value }} {% endif %}{% if let Some(value) = route.matcher.reference_prefix %}reference={{ value }}{% endif %}</small></div>
+                {% if user.can_write %}<div class="row-actions"><a class="button button-secondary" href="/dashboard/config?edit={{ route.name }}">Edit</a><form method="post" action="/dashboard/config/route/{{ route.name }}/delete"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="button button-secondary" type="submit">Delete</button></form></div>{% endif %}
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+        <form method="post" action="/dashboard/config/route" class="stack-form config-form">
+            <input type="hidden" name="csrf" value="{{ csrf }}"><h3>{% if editor.editing %}Edit route{% else %}Add route{% endif %}</h3>
+            <label for="route-name">Name</label><input id="route-name" name="name" value="{{ editor.name }}" placeholder="timamu" required>
+            <label for="destination_url">Destination URL</label><input id="destination_url" name="destination_url" type="url" value="{{ editor.destination_url }}" placeholder="https://api.example.com/webhook" required>
+            <label for="metadata_app">Metadata app</label><input id="metadata_app" name="metadata_app" value="{{ editor.metadata_app }}" placeholder="timamu">
+            <label for="plan_code_prefix">Plan code prefix</label><input id="plan_code_prefix" name="plan_code_prefix" value="{{ editor.plan_code_prefix }}" placeholder="PLN_tm">
+            <label for="reference_prefix">Reference prefix</label><input id="reference_prefix" name="reference_prefix" value="{{ editor.reference_prefix }}" placeholder="tm_">
+            <div class="two-col"><div><label for="timeout_seconds">Timeout seconds</label><input id="timeout_seconds" name="timeout_seconds" type="number" min="1" max="60" value="{{ editor.timeout_seconds }}"></div><div><label for="max_attempts">Max attempts</label><input id="max_attempts" name="max_attempts" type="number" min="1" max="10" value="{{ editor.max_attempts }}"></div></div>
+            <label class="check-label"><input type="checkbox" name="enabled"{% if editor.enabled %} checked{% endif %}> Enabled</label>
+            <div class="row-actions"><button class="button button-primary" type="submit">Save route</button>{% if editor.editing %}<a class="button button-secondary" href="/dashboard/config">Cancel</a>{% endif %}</div>
+        </form>
+    </article>
+</section>
+<section class="panel">
+    <div class="panel-heading"><div><h2>Test the matcher</h2><p class="muted">Paste a payload to verify a routing decision. Nothing is forwarded.</p></div></div>
+    <form method="post" action="/dashboard/config/test-route" class="stack-form"><input type="hidden" name="csrf" value="{{ csrf }}"><div class="two-col"><div><label for="test-route">Expected route</label><select id="test-route" name="route">{% for route in routes %}<option value="{{ route.name }}">{{ route.name }}</option>{% endfor %}</select></div><div></div></div><label for="payload">Payload</label><textarea id="payload" name="payload" class="payload-input" rows="7">{"event":"charge.success","data":{"metadata":{"app":"timamu"}}}</textarea><button class="button button-secondary" type="submit">Test route</button></form>
+</section>
 {% endblock %}

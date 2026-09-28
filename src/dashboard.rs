@@ -43,6 +43,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/dashboard/audit", get(audit))
         .route("/dashboard/config", get(configuration))
         .route("/dashboard/config/route", post(save_route))
+        .route("/dashboard/config/route/{name}/delete", post(delete_route))
         .route("/dashboard/config/source", post(save_source))
         .route("/dashboard/config/test-route", post(test_route))
         .route("/dashboard/users", get(users))
@@ -155,10 +156,40 @@ struct ConfigurationPage {
     user: SessionUser,
     sources: Vec<SourceView>,
     routes: Vec<RouteView>,
+    editor: RouteEditor,
     csrf: String,
     message: Option<String>,
     error: Option<String>,
     test_result: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RouteEditor {
+    name: String,
+    destination_url: String,
+    metadata_app: String,
+    plan_code_prefix: String,
+    reference_prefix: String,
+    timeout_seconds: i32,
+    max_attempts: i32,
+    enabled: bool,
+    editing: bool,
+}
+
+impl Default for RouteEditor {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            destination_url: String::new(),
+            metadata_app: String::new(),
+            plan_code_prefix: String::new(),
+            reference_prefix: String::new(),
+            timeout_seconds: 10,
+            max_attempts: 10,
+            enabled: true,
+            editing: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Template)]
@@ -251,6 +282,11 @@ struct ExportQuery {
     event_type: Option<String>,
     source: Option<String>,
     raw: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ConfigurationQuery {
+    edit: Option<String>,
 }
 
 async fn login(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -664,7 +700,7 @@ async fn retry_now(
         }
         Ok(false) => (
             StatusCode::BAD_REQUEST,
-            "This event is not waiting for retry",
+            "This event has no retryable delivery. Use Replay event to resend a delivered, dead, or unrouted event.",
         )
             .into_response(),
         Err(error) => server_error(error),
@@ -1032,7 +1068,11 @@ async fn save_settings(
     Redirect::to("/dashboard/settings").into_response()
 }
 
-async fn configuration(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+async fn configuration(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ConfigurationQuery>,
+) -> Response {
     let Some(user) = require_user(&state, &headers).await else {
         return Redirect::to("/login").into_response();
     };
@@ -1044,15 +1084,68 @@ async fn configuration(State(state): State<Arc<AppState>>, headers: HeaderMap) -
         Ok(routes) => routes,
         Err(error) => return server_error(error),
     };
+    let editor = query
+        .edit
+        .as_deref()
+        .and_then(|name| routes.iter().find(|route| route.name == name))
+        .map(|route| RouteEditor {
+            name: route.name.clone(),
+            destination_url: route.destination_url.clone(),
+            metadata_app: route.matcher.metadata_app.clone().unwrap_or_default(),
+            plan_code_prefix: route.matcher.plan_code_prefix.clone().unwrap_or_default(),
+            reference_prefix: route.matcher.reference_prefix.clone().unwrap_or_default(),
+            timeout_seconds: route.timeout_seconds,
+            max_attempts: route.max_attempts,
+            enabled: route.enabled,
+            editing: true,
+        })
+        .unwrap_or_default();
     render(ConfigurationPage {
         user,
         sources,
         routes,
+        editor,
         csrf: current_csrf(&state, &headers).await.unwrap_or_default(),
         message: None,
         error: None,
         test_result: None,
     })
+}
+
+async fn delete_route(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Form(form): Form<UserActionForm>,
+) -> Response {
+    let Some(user) = require_user(&state, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    if !user.can_write || !csrf_matches(&user.csrf_token, Some(&form.csrf)) {
+        return (StatusCode::FORBIDDEN, "Action not permitted").into_response();
+    }
+    match state.db.delete_database_route(&name).await {
+        Ok(true) => {
+            if let Err(error) = state.reload_runtime_config().await {
+                return server_error(error);
+            }
+            state.clear_route_cache().await;
+            let _ = state
+                .db
+                .audit(
+                    Some(user.id),
+                    "route_delete",
+                    Some("route"),
+                    Some(&name),
+                    &Value::Null,
+                    None,
+                )
+                .await;
+            Redirect::to("/dashboard/config").into_response()
+        }
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(error),
+    }
 }
 
 async fn save_route(
@@ -1223,6 +1316,7 @@ async fn test_route(
         user,
         sources,
         routes,
+        editor: RouteEditor::default(),
         csrf: current_csrf(&state, &headers).await.unwrap_or_default(),
         message: None,
         error: None,
