@@ -42,7 +42,9 @@ async fn setup() -> (Arc<AppState>, Database) {
         alerts: None,
         retention_days: 90,
     };
-    (Arc::new(AppState::new(config, db.clone()).unwrap()), db)
+    let mut state = Arc::new(AppState::new(config, db.clone()).unwrap());
+    Arc::get_mut(&mut state).unwrap().admin_token = Some("test-admin".to_owned());
+    (state, db)
 }
 
 async fn request(
@@ -51,15 +53,10 @@ async fn request(
     uri: &str,
     body: Option<Value>,
 ) -> axum::response::Response {
-    let mut builder = Request::builder().method(method).uri(uri).header(
-        "authorization",
-        format!(
-            "Bearer {}",
-            std::env::var("ADMIN_BOOTSTRAP_TOKEN")
-                .or_else(|_| std::env::var("ADMIN_TOKEN"))
-                .unwrap()
-        ),
-    );
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", "Bearer test-admin");
     if body.is_some() {
         builder = builder.header("content-type", "application/json");
     }

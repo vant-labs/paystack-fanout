@@ -38,6 +38,7 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub trust_proxy: bool,
     pub admin_token: Option<String>,
+    pub bootstrap_token: Option<String>,
     pub cookie_secure: bool,
     pub login_limits: Arc<std::sync::Mutex<HashMap<String, (u32, Instant)>>>,
     pub runtime_config: Arc<tokio::sync::RwLock<Config>>,
@@ -70,9 +71,10 @@ impl AppState {
                 .build()?,
             trust_proxy: std::env::var("TRUST_PROXY")
                 .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
-            admin_token: std::env::var("ADMIN_TOKEN")
+            admin_token: std::env::var("ADMIN_TOKEN").ok(),
+            bootstrap_token: std::env::var("ADMIN_BOOTSTRAP_TOKEN")
                 .ok()
-                .or_else(|| std::env::var("ADMIN_BOOTSTRAP_TOKEN").ok()),
+                .or_else(|| std::env::var("ADMIN_TOKEN").ok()),
             cookie_secure: std::env::var("COOKIE_SECURE")
                 .map(|value| !value.eq_ignore_ascii_case("false"))
                 .unwrap_or(true),
@@ -676,6 +678,17 @@ async fn api_authorized(state: &AppState, headers: &HeaderMap, write: bool) -> b
     }) {
         return true;
     }
+    if state.bootstrap_token.as_deref().is_some_and(|token| {
+        bearer_matches(
+            token,
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+        )
+    }) && state.db.user_count().await.ok() == Some(0)
+    {
+        return true;
+    }
     let Some(token) = crate::auth::session_token(headers) else {
         return false;
     };
@@ -975,7 +988,7 @@ pub(crate) async fn bootstrap_admin(
     headers: HeaderMap,
     Json(body): Json<BootstrapBody>,
 ) -> Response {
-    if !state.admin_token.as_deref().is_some_and(|token| {
+    if !state.bootstrap_token.as_deref().is_some_and(|token| {
         bearer_matches(
             token,
             headers
