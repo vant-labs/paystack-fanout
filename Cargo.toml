@@ -1,0 +1,47 @@
+[package]
+name = "paystack-fanout"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A small, durable webhook router for Paystack events"
+authors = ["Abdulhakim Haliru <hakimkal@gmail.com>"]
+repository = "https://github.com/abdulhakim/paystack-fanout"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["macros"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+hmac = "0.12"
+hex = "0.4"
+futures-util = "0.3"
+http = "1"
+http-body-util = "0.1"
+hyper = "1"
+ipnet = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "migrate", "macros"] }
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

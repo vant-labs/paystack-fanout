@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  provenance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check repository text
+        shell: bash
+        run: |
+          set -euo pipefail
+          pattern='co-authored-by|generated|\bai\b|codex|openai|chatgpt|claude|copilot|llm'
+          if git grep -IinE "$pattern" -- . ':(exclude).githooks/commit-msg' ':(exclude).github/workflows/ci.yml'; then
+            echo "prohibited text found in tracked files" >&2
+            exit 1
+          fi
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if git log --format='%B' "$base..${{ github.sha }}" | grep -Eiq "$pattern"; then
+            echo "prohibited text found in commit messages" >&2
+            exit 1
+          fi
+

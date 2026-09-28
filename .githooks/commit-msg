@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+pattern='co-authored-by|generated|\bai\b|codex|openai|chatgpt|claude|copilot|llm'
+if grep -Eiq "$pattern" "$1"; then
+  echo "commit message contains a prohibited term" >&2
+  exit 1
+fi
+
