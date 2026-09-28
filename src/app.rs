@@ -34,10 +34,19 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub trust_proxy: bool,
     pub admin_token: Option<String>,
+    alert_url_override: Option<String>,
 }
 
 impl AppState {
     pub fn new(config: Config, db: Database) -> anyhow::Result<Self> {
+        Self::new_with_alert_url(config, db, None)
+    }
+
+    pub fn new_with_alert_url(
+        config: Config,
+        db: Database,
+        alert_url_override: Option<String>,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             config,
             db,
@@ -48,11 +57,16 @@ impl AppState {
             trust_proxy: std::env::var("TRUST_PROXY")
                 .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
             admin_token: std::env::var("ADMIN_TOKEN").ok(),
+            alert_url_override,
         })
     }
 
     pub async fn alert(&self, text: String) {
-        let Some(url) = self.config.alert_url() else {
+        let Some(url) = self
+            .alert_url_override
+            .clone()
+            .or_else(|| self.config.alert_url())
+        else {
             return;
         };
         let result = self

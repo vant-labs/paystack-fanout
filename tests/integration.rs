@@ -1,4 +1,11 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use axum::{
     body::Body,
@@ -17,7 +24,7 @@ use serial_test::serial;
 use sha2::Sha512;
 use tower::ServiceExt;
 use wiremock::{
-    Mock, MockServer, ResponseTemplate,
+    Mock, MockServer, Request as WireRequest, Respond, ResponseTemplate,
     matchers::{method, path},
 };
 
@@ -27,7 +34,7 @@ fn can_run() -> bool {
     std::env::var("DATABASE_URL").is_ok() && std::env::var("PAYSTACK_SECRET_KEY").is_ok()
 }
 
-async fn setup(destination: String) -> (Arc<AppState>, Database) {
+async fn setup(destination: String, alert_url: Option<String>) -> (Arc<AppState>, Database) {
     let db = Database::connect(&std::env::var("DATABASE_URL").unwrap())
         .await
         .unwrap();
@@ -60,7 +67,7 @@ async fn setup(destination: String) -> (Arc<AppState>, Database) {
         alerts: None,
         retention_days: 90,
     };
-    let state = Arc::new(AppState::new(config, db.clone()).unwrap());
+    let state = Arc::new(AppState::new_with_alert_url(config, db.clone(), alert_url).unwrap());
     (state, db)
 }
 
@@ -102,7 +109,7 @@ async fn ingest_is_deduplicated_and_worker_preserves_body_and_signature() {
         .expect(1)
         .mount(&server)
         .await;
-    let (state, db) = setup(format!("{}/destination", server.uri())).await;
+    let (state, db) = setup(format!("{}/destination", server.uri()), None).await;
     let body = serde_json::to_vec(
         &json!({"event":"charge.success","data":{"reference":"test_1","metadata":{"app":"test"}}}),
     )
@@ -149,7 +156,7 @@ async fn two_workers_do_not_double_claim_a_delivery() {
         .expect(1)
         .mount(&server)
         .await;
-    let (state, db) = setup(format!("{}/destination", server.uri())).await;
+    let (state, db) = setup(format!("{}/destination", server.uri()), None).await;
     let body = serde_json::to_vec(&json!({"event":"charge.success","data":{"reference":"test_2"}}))
         .unwrap();
     assert_eq!(post_event(state.clone(), body).await, StatusCode::OK);
@@ -164,6 +171,164 @@ async fn two_workers_do_not_double_claim_a_delivery() {
             .unwrap()
             .first()
             .unwrap()
+            .status,
+        "delivered"
+    );
+    server.verify().await;
+}
+
+struct SequenceResponder {
+    calls: Arc<AtomicUsize>,
+}
+
+impl Respond for SequenceResponder {
+    fn respond(&self, _request: &WireRequest) -> ResponseTemplate {
+        if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+            ResponseTemplate::new(500).set_body_string("temporary failure")
+        } else {
+            ResponseTemplate::new(200)
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn destination_failure_is_retried_then_delivered() {
+    if !can_run() {
+        return;
+    }
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/destination"))
+        .respond_with(SequenceResponder {
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let (state, db) = setup(format!("{}/destination", server.uri()), None).await;
+    let body =
+        serde_json::to_vec(&json!({"event":"charge.success","data":{"reference":"test_retry"}}))
+            .unwrap();
+    assert_eq!(post_event(state.clone(), body).await, StatusCode::OK);
+    let delivery = db.claim_delivery().await.unwrap().unwrap();
+    paystack_fanout::worker::process_one(&state, delivery).await;
+    let event_id = db.list_events(None, None, None, None, 10, 0).await.unwrap()[0].id;
+    sqlx::query("UPDATE deliveries SET next_attempt_at = now() WHERE event_id = $1")
+        .bind(event_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let delivery = db.claim_delivery().await.unwrap().unwrap();
+    paystack_fanout::worker::process_one(&state, delivery).await;
+    assert_eq!(
+        db.get_event(event_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .summary
+            .status,
+        "delivered"
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn dead_event_and_unrouted_event_alert() {
+    if !can_run() {
+        return;
+    }
+    let destination = MockServer::start().await;
+    let alerts = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/destination"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&destination)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/alert"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&alerts)
+        .await;
+    let (state, db) = setup(
+        format!("{}/destination", destination.uri()),
+        Some(format!("{}/alert", alerts.uri())),
+    )
+    .await;
+    let dead_body =
+        serde_json::to_vec(&json!({"event":"charge.success","data":{"reference":"test_dead"}}))
+            .unwrap();
+    assert_eq!(post_event(state.clone(), dead_body).await, StatusCode::OK);
+    let dead_id = db.list_events(None, None, None, None, 10, 0).await.unwrap()[0].id;
+    sqlx::query("UPDATE deliveries SET attempts = 9 WHERE event_id = $1")
+        .bind(dead_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let delivery = db.claim_delivery().await.unwrap().unwrap();
+    paystack_fanout::worker::process_one(&state, delivery).await;
+    assert_eq!(
+        db.get_event(dead_id).await.unwrap().unwrap().summary.status,
+        "dead"
+    );
+
+    let unrouted_body = serde_json::to_vec(
+        &json!({"event":"refund.processed","data":{"transaction_reference":"unknown"}}),
+    )
+    .unwrap();
+    assert_eq!(
+        post_event(state.clone(), unrouted_body).await,
+        StatusCode::OK
+    );
+    let events = db
+        .list_events(Some("unrouted"), None, None, None, 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    alerts.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn an_unrouted_event_can_be_replayed_to_a_route() {
+    if !can_run() {
+        return;
+    }
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/destination"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (state, db) = setup(format!("{}/destination", server.uri()), None).await;
+    let body = serde_json::to_vec(
+        &json!({"event":"refund.processed","data":{"transaction_reference":"unknown"}}),
+    )
+    .unwrap();
+    assert_eq!(post_event(state.clone(), body).await, StatusCode::OK);
+    let event_id = db
+        .list_events(Some("unrouted"), None, None, None, 10, 0)
+        .await
+        .unwrap()[0]
+        .id;
+    assert!(
+        db.replay(event_id, Some("test"), &state.config)
+            .await
+            .unwrap()
+    );
+    let delivery = db.claim_delivery().await.unwrap().unwrap();
+    paystack_fanout::worker::process_one(&state, delivery).await;
+    assert_eq!(
+        db.get_event(event_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .summary
             .status,
         "delivered"
     );

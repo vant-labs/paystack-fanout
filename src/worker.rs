@@ -36,7 +36,7 @@ pub async fn run_worker(state: Arc<AppState>) {
     }
 }
 
-async fn process_one(state: &AppState, delivery: ClaimedDelivery) {
+pub async fn process_one(state: &AppState, delivery: ClaimedDelivery) {
     let started = Utc::now();
     let timer = Instant::now();
     let request = state
