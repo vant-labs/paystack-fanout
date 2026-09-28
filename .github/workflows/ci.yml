@@ -86,6 +86,7 @@ jobs:
           DATABASE_URL: postgres://fanout:fanout@localhost:5432/fanout
           PAYSTACK_SECRET_KEY: sk_test_ci
           FANOUT_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          ADMIN_BOOTSTRAP_TOKEN: bootstrap-ci
 
   docker:
     runs-on: ubuntu-latest
@@ -115,8 +116,8 @@ jobs:
           unset PORT FANOUT_CONFIG
           container_id="$(docker run -d --network host --name paystack-fanout-docker-smoke \
             -e DATABASE_URL=postgres://fanout:fanout@127.0.0.1:5432/fanout \
-            -e PAYSTACK_SECRET_KEY=sk_test_ci \
-            -e FANOUT_ENCRYPTION_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+            -e MASTER_ENCRYPTION_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+            -e ADMIN_BOOTSTRAP_TOKEN=bootstrap-ci \
             paystack-fanout:ci)"
           trap 'docker logs "$container_id"; docker rm -f "$container_id"' EXIT
           timeout 60 bash -c 'until curl -fsS http://127.0.0.1:8080/readyz; do sleep 1; done'
@@ -136,8 +137,9 @@ jobs:
         run: printf 'long secure password\nlong secure password\n' | ./target/debug/paystack-fanout create-owner --email owner@example.com
         env:
           DATABASE_URL: postgres://fanout:fanout@localhost:5432/fanout
+          MASTER_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          ADMIN_BOOTSTRAP_TOKEN: bootstrap-ci
           PAYSTACK_SECRET_KEY: sk_test_ci
-          FANOUT_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
           FANOUT_OWNER_PASSWORD: long secure password
           FANOUT_OWNER_PASSWORD_CONFIRM: long secure password
       - name: Start service
@@ -147,6 +149,8 @@ jobs:
           FANOUT_CONFIG: config.example.toml
           PAYSTACK_SECRET_KEY: sk_test_ci
           FANOUT_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          MASTER_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          ADMIN_BOOTSTRAP_TOKEN: bootstrap-ci
           COOKIE_SECURE: false
           TRUST_PROXY: true
       - name: Wait for readiness

@@ -119,9 +119,13 @@ async fn finish_failure(
     error: Option<&str>,
     latency_ms: i32,
 ) {
-    let next = retry_delay(delivery.attempt).map(|delay| {
-        Utc::now() + chrono::Duration::from_std(jitter(delay)).expect("jitter duration is valid")
-    });
+    let next = (delivery.attempt < delivery.max_attempts)
+        .then(|| retry_delay(delivery.attempt))
+        .flatten()
+        .map(|delay| {
+            Utc::now()
+                + chrono::Duration::from_std(jitter(delay)).expect("jitter duration is valid")
+        });
     let is_dead = next.is_none();
     if let Err(db_error) = state
         .db

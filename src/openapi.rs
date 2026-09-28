@@ -28,14 +28,29 @@ impl Modify for BearerAuth {
         crate::app::list_events,
         crate::app::get_event,
         crate::app::replay_event,
-        crate::app::bulk_replay
+        crate::app::bulk_replay,
+        crate::app::list_admin_routes,
+        crate::app::create_admin_route,
+        crate::app::update_admin_route,
+        crate::app::delete_admin_route,
+        crate::app::list_admin_deliveries,
+        crate::app::list_admin_settings,
+        crate::app::set_admin_setting,
+        crate::app::delete_admin_setting,
+        crate::app::bootstrap_admin
     ),
     components(
         schemas(
             crate::db::EventSummary,
             crate::db::EventDetail,
             crate::db::AttemptView,
-            crate::app::ReplayBody
+            crate::db::DatabaseRoute,
+            crate::db::DeliveryView,
+            crate::db::SettingView,
+            crate::app::ReplayBody,
+            crate::app::RouteWriteBody,
+            crate::app::SettingWriteBody,
+            crate::app::BootstrapBody
         )
     ),
     modifiers(&BearerAuth),

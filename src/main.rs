@@ -51,12 +51,14 @@ async fn main() -> Result<()> {
         .database_url
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("missing required environment variable DATABASE_URL"))?;
-    std::env::var("PAYSTACK_SECRET_KEY").map_err(|_| {
-        anyhow::anyhow!("missing required environment variable PAYSTACK_SECRET_KEY")
-    })?;
-    std::env::var("FANOUT_ENCRYPTION_KEY").map_err(|_| {
-        anyhow::anyhow!("missing required environment variable FANOUT_ENCRYPTION_KEY")
-    })?;
+    if std::env::var("MASTER_ENCRYPTION_KEY").is_err()
+        && std::env::var("FANOUT_ENCRYPTION_KEY").is_err()
+    {
+        anyhow::bail!("missing required environment variable MASTER_ENCRYPTION_KEY");
+    }
+    if std::env::var("ADMIN_BOOTSTRAP_TOKEN").is_err() && std::env::var("ADMIN_TOKEN").is_err() {
+        anyhow::bail!("missing required environment variable ADMIN_BOOTSTRAP_TOKEN");
+    }
     let db = Database::connect(database_url).await?;
     db.migrate().await?;
     if let Some(Command::CreateOwner { email }) = args.command {
@@ -75,6 +77,7 @@ async fn main() -> Result<()> {
     db.seed_runtime_config(&config).await?;
     let state = Arc::new(AppState::new(config, db)?);
     state.reload_runtime_config().await?;
+    let _ = state.cached_routes().await;
     if matches!(args.role, Role::Worker | Role::All) {
         tokio::spawn(run_worker(state.clone()));
         tokio::spawn(retention_loop(state.clone()));

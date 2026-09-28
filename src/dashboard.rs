@@ -1105,6 +1105,7 @@ async fn save_route(
             if let Err(error) = state.reload_runtime_config().await {
                 return server_error(error);
             }
+            state.clear_route_cache().await;
             let _ = state
                 .db
                 .audit(

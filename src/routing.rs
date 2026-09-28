@@ -1,6 +1,9 @@
 use serde_json::Value;
 
-use crate::config::{Config, RouteConfig};
+use crate::{
+    config::{Config, RouteConfig},
+    db::DatabaseRoute,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatchSource {
@@ -14,6 +17,34 @@ pub enum MatchSource {
 pub struct RouteDecision {
     pub route: Option<RouteConfig>,
     pub source: MatchSource,
+}
+
+pub fn database_route<'a>(
+    routes: &'a [DatabaseRoute],
+    payload: &Value,
+) -> Option<&'a DatabaseRoute> {
+    let data = payload.get("data").unwrap_or(payload);
+    let app = metadata_app(data);
+    let reference = reference(data);
+    routes.iter().find(|route| {
+        route
+            .metadata_app
+            .as_deref()
+            .is_some_and(|value| app.as_deref() == Some(value))
+            || route.ref_prefix.as_deref().is_some_and(|prefix| {
+                reference
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with(prefix))
+            })
+    })
+}
+
+pub fn reference(data: &Value) -> Option<String> {
+    data.get("reference")
+        .and_then(Value::as_str)
+        .or_else(|| data.get("subscription_code").and_then(Value::as_str))
+        .or_else(|| data.get("customer_code").and_then(Value::as_str))
+        .map(str::to_owned)
 }
 
 /// The field names here are taken from Paystack's webhook and API examples:
@@ -97,7 +128,7 @@ pub fn decide(config: &Config, payload: &Value) -> RouteDecision {
     }
 }
 
-fn metadata_app(data: &Value) -> Option<String> {
+pub fn metadata_app(data: &Value) -> Option<String> {
     let metadata = data.get("metadata")?;
     if let Some(app) = metadata.get("app").and_then(Value::as_str) {
         return Some(app.to_owned());
@@ -133,6 +164,7 @@ fn extract_plan_code(value: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::{FallbackConfig, RouteMatcher, SourceConfig};
+    use crate::db::DatabaseRoute;
     use std::{collections::HashMap, net::IpAddr};
 
     fn config() -> Config {
@@ -202,6 +234,46 @@ mod tests {
         let decision = decide(&c, &payload);
         assert!(decision.route.is_none());
         assert_eq!(decision.source, MatchSource::Fallback);
+    }
+
+    #[test]
+    fn database_routes_match_metadata_or_reference_in_order() {
+        let routes = vec![
+            DatabaseRoute {
+                id: uuid::Uuid::new_v4(),
+                name: "timamu".into(),
+                target_url: "https://example.invalid/timamu".into(),
+                ref_prefix: Some("tm_".into()),
+                metadata_app: Some("timamu".into()),
+                enabled: true,
+            },
+            DatabaseRoute {
+                id: uuid::Uuid::new_v4(),
+                name: "screencrafter".into(),
+                target_url: "https://example.invalid/screencrafter".into(),
+                ref_prefix: Some("sc_".into()),
+                metadata_app: Some("screencrafter".into()),
+                enabled: true,
+            },
+        ];
+        assert_eq!(
+            database_route(&routes, &serde_json::json!({"data":{"reference":"tm_1"}}))
+                .unwrap()
+                .name,
+            "timamu"
+        );
+        assert_eq!(
+            database_route(
+                &routes,
+                &serde_json::json!({"data":{"metadata":{"app":"screencrafter"}}})
+            )
+            .unwrap()
+            .name,
+            "screencrafter"
+        );
+        assert!(
+            database_route(&routes, &serde_json::json!({"data":{"reference":"other"}})).is_none()
+        );
     }
 
     #[allow(dead_code)]

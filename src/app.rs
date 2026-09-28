@@ -11,7 +11,7 @@ use axum::{
     extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, patch, post, put},
 };
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -22,11 +22,11 @@ use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
 use crate::{
-    config::Config,
-    db::{Database, InsertResult},
+    config::{Config, RouteConfig as ConfigRoute},
+    db::{Database, DatabaseRoute, InsertResult},
     metrics::Metrics,
     provider::{PaystackProvider, Provider},
-    routing::{MatchSource, decide},
+    routing::{MatchSource, database_route, decide, reference},
     security::{bearer_matches, dedupe_key},
 };
 
@@ -43,8 +43,12 @@ pub struct AppState {
     pub runtime_config: Arc<tokio::sync::RwLock<Config>>,
     pub runtime_secrets: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
     pub runtime_alert_url: Arc<tokio::sync::RwLock<Option<String>>>,
+    pub runtime_loaded_at: Arc<tokio::sync::RwLock<Instant>>,
+    pub route_cache: Arc<tokio::sync::RwLock<RouteCache>>,
     alert_url_override: Option<String>,
 }
+
+pub type RouteCache = Option<(Instant, Vec<DatabaseRoute>)>;
 
 impl AppState {
     pub fn new(config: Config, db: Database) -> anyhow::Result<Self> {
@@ -66,7 +70,9 @@ impl AppState {
                 .build()?,
             trust_proxy: std::env::var("TRUST_PROXY")
                 .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
-            admin_token: std::env::var("ADMIN_TOKEN").ok(),
+            admin_token: std::env::var("ADMIN_TOKEN")
+                .ok()
+                .or_else(|| std::env::var("ADMIN_BOOTSTRAP_TOKEN").ok()),
             cookie_secure: std::env::var("COOKIE_SECURE")
                 .map(|value| !value.eq_ignore_ascii_case("false"))
                 .unwrap_or(true),
@@ -74,6 +80,8 @@ impl AppState {
             runtime_config: Arc::new(tokio::sync::RwLock::new(runtime_config)),
             runtime_secrets: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             runtime_alert_url: Arc::new(tokio::sync::RwLock::new(None)),
+            runtime_loaded_at: Arc::new(tokio::sync::RwLock::new(Instant::now())),
+            route_cache: Arc::new(tokio::sync::RwLock::new(None)),
             alert_url_override,
         })
     }
@@ -83,7 +91,16 @@ impl AppState {
         *self.runtime_config.write().await = config;
         *self.runtime_secrets.write().await = secrets;
         *self.runtime_alert_url.write().await = self.db.alert_url_setting().await;
+        *self.runtime_loaded_at.write().await = Instant::now();
         Ok(())
+    }
+
+    pub async fn refresh_runtime_if_stale(&self) {
+        if self.runtime_loaded_at.read().await.elapsed() >= Duration::from_secs(30)
+            && let Err(error) = self.reload_runtime_config().await
+        {
+            tracing::warn!(error = %error, "runtime settings refresh failed");
+        }
     }
 
     pub async fn alert(&self, text: String) {
@@ -110,6 +127,37 @@ impl AppState {
             tracing::warn!(error = %error, "alert delivery failed");
         }
     }
+
+    pub async fn clear_route_cache(&self) {
+        *self.route_cache.write().await = None;
+    }
+
+    pub async fn cached_routes(&self) -> Vec<DatabaseRoute> {
+        if let Some((loaded_at, routes)) = self.route_cache.read().await.as_ref()
+            && loaded_at.elapsed() < Duration::from_secs(30)
+        {
+            return routes.clone();
+        }
+        match self.db.list_database_routes().await {
+            Ok(routes) => {
+                let routes = routes
+                    .into_iter()
+                    .filter(|route| route.enabled)
+                    .collect::<Vec<_>>();
+                *self.route_cache.write().await = Some((Instant::now(), routes.clone()));
+                routes
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "route refresh failed; using cached routes");
+                self.route_cache
+                    .read()
+                    .await
+                    .as_ref()
+                    .map(|(_, routes)| routes.clone())
+                    .unwrap_or_default()
+            }
+        }
+    }
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -126,6 +174,21 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/admin/events", get(list_events))
         .route("/admin/events/{id}", get(get_event).post(replay_event))
         .route("/admin/replay", post(bulk_replay))
+        .route(
+            "/admin/routes",
+            get(list_admin_routes).post(create_admin_route),
+        )
+        .route(
+            "/admin/routes/{name}",
+            patch(update_admin_route).delete(delete_admin_route),
+        )
+        .route("/admin/deliveries", get(list_admin_deliveries))
+        .route("/admin/settings", get(list_admin_settings))
+        .route(
+            "/admin/settings/{key}",
+            put(set_admin_setting).delete(delete_admin_setting),
+        )
+        .route("/admin/bootstrap", post(bootstrap_admin))
         .layer(axum::extract::DefaultBodyLimit::max(256 * 1024))
         .with_state(state)
 }
@@ -152,6 +215,7 @@ pub(crate) async fn ingest(
     remote: ConnectInfo<SocketAddr>,
     body: Bytes,
 ) -> Response {
+    state.refresh_runtime_if_stale().await;
     let active_config = state.runtime_config.read().await.clone();
     let active_secrets = state.runtime_secrets.read().await.clone();
     let Some(source_config) = active_config.source.get(&source) else {
@@ -202,7 +266,32 @@ pub(crate) async fn ingest(
         }
     };
     let event_type = PaystackProvider.event_type(&payload);
-    let decision = decide(&active_config, &payload);
+    let database_routes = state.cached_routes().await;
+    let database_match = database_route(&database_routes, &payload);
+    let database_route_id = database_match.map(|route| route.id);
+    let decision = if let Some(route) = database_match {
+        crate::routing::RouteDecision {
+            source: if route.metadata_app.as_deref().is_some_and(|value| {
+                crate::routing::metadata_app(payload.get("data").unwrap_or(&payload)).as_deref()
+                    == Some(value)
+            }) {
+                MatchSource::MetadataApp
+            } else {
+                MatchSource::Reference
+            },
+            route: Some(ConfigRoute {
+                name: route.name.clone(),
+                destination_url: route.target_url.clone(),
+                matcher: crate::config::RouteMatcher {
+                    metadata_app: route.metadata_app.clone(),
+                    reference_prefix: route.ref_prefix.clone(),
+                    plan_code_prefix: None,
+                },
+            }),
+        }
+    } else {
+        decide(&active_config, &payload)
+    };
     let matched_route = decision.route.as_ref().map(|route| route.name.as_str());
     if matches!(decision.source, MatchSource::Fallback) && matched_route.is_some() {
         state
@@ -264,6 +353,20 @@ pub(crate) async fn ingest(
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         InsertResult::Inserted { event_id } => {
+            if let Err(error) = state
+                .db
+                .annotate_delivery(
+                    event_id,
+                    event_type,
+                    reference(payload.get("data").unwrap_or(&payload)).as_deref(),
+                    database_route_id,
+                    matched_route.is_some(),
+                )
+                .await
+            {
+                tracing::error!(error = %error, event_id = %event_id, "recording delivery metadata failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
             if matched_route.is_none() {
                 state
                     .metrics
@@ -323,15 +426,33 @@ pub(crate) async fn healthz() -> impl IntoResponse {
     tag = "Operations"
 )]
 pub(crate) async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match sqlx::query_scalar::<_, i32>("SELECT 1")
+    if let Err(error) = sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(&state.db.pool)
         .await
     {
-        Ok(_) => StatusCode::OK,
-        Err(error) => {
-            tracing::warn!(error = %error, "readiness check failed");
-            StatusCode::SERVICE_UNAVAILABLE
-        }
+        tracing::warn!(error = %error, "readiness check failed");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "not_ready", "reason": "database unavailable"})),
+        );
+    }
+    let config = state.runtime_config.read().await;
+    let secrets = state.runtime_secrets.read().await;
+    let missing = config
+        .source
+        .iter()
+        .filter(|(name, source)| {
+            !secrets.contains_key(*name) && std::env::var(&source.secret_env).is_err()
+        })
+        .map(|(_, source)| source.secret_env.clone())
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        (StatusCode::OK, Json(json!({"status": "ready"})))
+    } else {
+        (
+            StatusCode::OK,
+            Json(json!({"status": "ready_with_missing_settings", "missing": missing})),
+        )
     }
 }
 
@@ -378,7 +499,7 @@ pub(crate) async fn list_events(
     headers: HeaderMap,
     Query(query): Query<EventQuery>,
 ) -> Response {
-    if !admin_ok(&state, &headers) {
+    if !api_authorized(&state, &headers, false).await {
         return StatusCode::NOT_FOUND.into_response();
     }
     let since = match query
@@ -426,7 +547,7 @@ pub(crate) async fn get_event(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Response {
-    if !admin_ok(&state, &headers) {
+    if !api_authorized(&state, &headers, false).await {
         return StatusCode::NOT_FOUND.into_response();
     }
     match state.db.get_event(id).await {
@@ -462,7 +583,7 @@ pub(crate) async fn replay_event(
     Path(id): Path<Uuid>,
     Json(body): Json<ReplayBody>,
 ) -> Response {
-    if !admin_ok(&state, &headers) {
+    if !api_authorized(&state, &headers, true).await {
         return StatusCode::NOT_FOUND.into_response();
     }
     let active_config = state.runtime_config.read().await.clone();
@@ -502,7 +623,7 @@ pub(crate) async fn bulk_replay(
     headers: HeaderMap,
     Query(query): Query<BulkReplayQuery>,
 ) -> Response {
-    if !admin_ok(&state, &headers) {
+    if !api_authorized(&state, &headers, true).await {
         return StatusCode::NOT_FOUND.into_response();
     }
     let (Some(status), Some(route)) = (query.status.as_deref(), query.route.as_deref()) else {
@@ -518,15 +639,375 @@ pub(crate) async fn bulk_replay(
     }
 }
 
-fn admin_ok(state: &AppState, headers: &HeaderMap) -> bool {
-    state.admin_token.as_deref().is_some_and(|token| {
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub(crate) struct RouteWriteBody {
+    pub name: Option<String>,
+    pub target_url: Option<String>,
+    pub ref_prefix: Option<String>,
+    pub metadata_app: Option<String>,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub(crate) struct SettingWriteBody {
+    pub value: String,
+    #[serde(default)]
+    pub is_secret: bool,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub(crate) struct BootstrapBody {
+    pub email: String,
+    pub password: String,
+}
+
+fn valid_https_target(value: &str) -> bool {
+    value.starts_with("https://") && value.len() > "https://".len()
+}
+
+async fn api_authorized(state: &AppState, headers: &HeaderMap, write: bool) -> bool {
+    if state.admin_token.as_deref().is_some_and(|token| {
         bearer_matches(
             token,
             headers
                 .get(header::AUTHORIZATION)
                 .and_then(|value| value.to_str().ok()),
         )
-    })
+    }) {
+        return true;
+    }
+    let Some(token) = crate::auth::session_token(headers) else {
+        return false;
+    };
+    state
+        .db
+        .session_user(&token)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|user| !write || user.can_write)
+}
+
+#[utoipa::path(
+    get,
+    path = "/admin/routes",
+    responses((status = 200, description = "Enabled routes", body = [crate::db::DatabaseRoute])),
+    security(("admin_bearer" = [])),
+    tag = "Admin API"
+)]
+pub(crate) async fn list_admin_routes(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if !api_authorized(&state, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.db.list_database_routes().await {
+        Ok(routes) => Json(routes).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "listing routes failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/admin/routes",
+    request_body = RouteWriteBody,
+    responses((status = 201, description = "Route created", body = crate::db::DatabaseRoute)),
+    security(("admin_bearer" = [])),
+    tag = "Admin API"
+)]
+pub(crate) async fn create_admin_route(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<RouteWriteBody>,
+) -> Response {
+    if !api_authorized(&state, &headers, true).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let (Some(name), Some(target_url)) = (body.name.as_deref(), body.target_url.as_deref()) else {
+        return (StatusCode::BAD_REQUEST, "name and target_url are required").into_response();
+    };
+    if name.trim().is_empty()
+        || !valid_https_target(target_url)
+        || (body.ref_prefix.is_none() && body.metadata_app.is_none())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "target_url must be https and at least one match rule is required",
+        )
+            .into_response();
+    }
+    match state
+        .db
+        .create_database_route(
+            name,
+            target_url,
+            body.ref_prefix.as_deref(),
+            body.metadata_app.as_deref(),
+            body.enabled.unwrap_or(true),
+        )
+        .await
+    {
+        Ok(route) => {
+            state.clear_route_cache().await;
+            (StatusCode::CREATED, Json(route)).into_response()
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "creating route failed");
+            StatusCode::BAD_REQUEST.into_response()
+        }
+    }
+}
+
+#[utoipa::path(
+    patch,
+    path = "/admin/routes/{name}",
+    params(("name" = String, Path, description = "Route name")),
+    request_body = RouteWriteBody,
+    responses((status = 200, description = "Route updated", body = crate::db::DatabaseRoute)),
+    security(("admin_bearer" = [])),
+    tag = "Admin API"
+)]
+pub(crate) async fn update_admin_route(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<RouteWriteBody>,
+) -> Response {
+    if !api_authorized(&state, &headers, true).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if body
+        .target_url
+        .as_deref()
+        .is_some_and(|value| !valid_https_target(value))
+    {
+        return (StatusCode::BAD_REQUEST, "target_url must be https").into_response();
+    }
+    match state
+        .db
+        .update_database_route(
+            &name,
+            body.target_url.as_deref(),
+            body.ref_prefix.as_deref().map(Some),
+            body.metadata_app.as_deref().map(Some),
+            body.enabled,
+        )
+        .await
+    {
+        Ok(Some(route)) => {
+            state.clear_route_cache().await;
+            Json(route).into_response()
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+
+#[utoipa::path(
+    delete,
+    path = "/admin/routes/{name}",
+    params(("name" = String, Path, description = "Route name")),
+    responses((status = 204, description = "Route deleted")),
+    security(("admin_bearer" = [])),
+    tag = "Admin API"
+)]
+pub(crate) async fn delete_admin_route(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    if !api_authorized(&state, &headers, true).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.db.delete_database_route(&name).await {
+        Ok(true) => {
+            state.clear_route_cache().await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "deleting route failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub(crate) struct DeliveryQuery {
+    reference: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/admin/deliveries",
+    params(DeliveryQuery),
+    responses((status = 200, description = "Delivery records", body = [crate::db::DeliveryView])),
+    security(("admin_bearer" = [])),
+    tag = "Admin API"
+)]
+pub(crate) async fn list_admin_deliveries(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<DeliveryQuery>,
+) -> Response {
+    if !api_authorized(&state, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.db.list_deliveries(query.reference.as_deref()).await {
+        Ok(deliveries) => Json(deliveries).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "listing deliveries failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/admin/settings",
+    responses((status = 200, description = "Settings with masked secret values", body = [crate::db::SettingView])),
+    security(("admin_bearer" = [])),
+    tag = "Admin API"
+)]
+pub(crate) async fn list_admin_settings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if !api_authorized(&state, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.db.list_settings().await {
+        Ok(settings) => Json(settings).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "listing settings failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[utoipa::path(
+    put,
+    path = "/admin/settings/{key}",
+    params(("key" = String, Path, description = "Setting key")),
+    request_body = SettingWriteBody,
+    responses((status = 204, description = "Setting stored")),
+    security(("admin_bearer" = [])),
+    tag = "Admin API"
+)]
+pub(crate) async fn set_admin_setting(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+    Json(body): Json<SettingWriteBody>,
+) -> Response {
+    if !api_authorized(&state, &headers, true).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if key.trim().is_empty() || body.value.is_empty() {
+        return (StatusCode::BAD_REQUEST, "key and value are required").into_response();
+    }
+    let is_secret =
+        body.is_secret || key.ends_with("KEY") || key.ends_with("TOKEN") || key.contains("WEBHOOK");
+    match state
+        .db
+        .set_setting(&key, &body.value, is_secret, None)
+        .await
+    {
+        Ok(()) => {
+            if let Err(error) = state.reload_runtime_config().await {
+                tracing::error!(error = %error, "reloading settings failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "saving setting failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[utoipa::path(
+    delete,
+    path = "/admin/settings/{key}",
+    params(("key" = String, Path, description = "Setting key")),
+    responses((status = 204, description = "Setting deleted")),
+    security(("admin_bearer" = [])),
+    tag = "Admin API"
+)]
+pub(crate) async fn delete_admin_setting(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+) -> Response {
+    if !api_authorized(&state, &headers, true).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.db.delete_setting(&key).await {
+        Ok(_) => {
+            if let Err(error) = state.reload_runtime_config().await {
+                tracing::error!(error = %error, "reloading settings failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "deleting setting failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/admin/bootstrap",
+    request_body = BootstrapBody,
+    responses((status = 201, description = "First admin created")),
+    security(("admin_bearer" = [])),
+    tag = "Admin API"
+)]
+pub(crate) async fn bootstrap_admin(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<BootstrapBody>,
+) -> Response {
+    if !state.admin_token.as_deref().is_some_and(|token| {
+        bearer_matches(
+            token,
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+        )
+    }) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.db.user_count().await {
+        Ok(0) => {
+            let Ok(hash) = crate::auth::hash_password(&body.password) else {
+                return StatusCode::BAD_REQUEST.into_response();
+            };
+            match state
+                .db
+                .create_user(&body.email, &hash, crate::auth::Role::Admin)
+                .await
+            {
+                Ok(_) => StatusCode::CREATED.into_response(),
+                Err(error) => {
+                    tracing::error!(error = %error, "creating first admin failed");
+                    StatusCode::BAD_REQUEST.into_response()
+                }
+            }
+        }
+        Ok(_) => StatusCode::CONFLICT.into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "checking admin bootstrap state failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 pub async fn retention_loop(state: Arc<AppState>) {
