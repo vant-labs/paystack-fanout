@@ -159,6 +159,55 @@ async fn viewer_cannot_replay() {
 
 #[tokio::test]
 #[serial]
+async fn admin_can_manage_users() {
+    if !can_run() {
+        return;
+    }
+    let (state, db) = setup().await;
+    db.create_owner(
+        "owner@example.com",
+        &hash_password("long secure password").unwrap(),
+    )
+    .await
+    .unwrap();
+    db.create_user(
+        "admin@example.com",
+        &hash_password("long secure password").unwrap(),
+        Role::Admin,
+    )
+    .await
+    .unwrap();
+    let (cookie, csrf) = login(state.clone(), "admin@example.com", "long secure password").await;
+    let page = request(
+        state.clone(),
+        "GET",
+        "/dashboard/users",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(page.status(), StatusCode::OK);
+    let response = request(
+        state.clone(),
+        "POST",
+        "/dashboard/users/create",
+        Some(&cookie),
+        Some(&format!(
+            "csrf={csrf}&email=viewer-created@example.com&password=long secure password&role=viewer"
+        )),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(
+        db.find_user_by_email("viewer-created@example.com")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn repeated_bad_logins_are_limited() {
     if !can_run() {
         return;

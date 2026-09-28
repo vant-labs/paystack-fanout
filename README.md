@@ -247,11 +247,11 @@ Pages are available after signing in:
 - `/dashboard/config` persisted sources, routes, encrypted write-only secrets, and matcher tests.
 - `/dashboard/users`, `/dashboard/audit`, and `/dashboard/settings` for access and policy.
 
-| Role | Read | Replay/retry | Edit routes and export | Manage users and sources |
-| --- | --- | --- | --- | --- |
-| Viewer | Yes | No | No | No |
-| Admin | Yes | Yes | Yes | No |
-| Owner | Yes | Yes | Yes | Yes |
+| Role | Read | Replay/retry | Edit routes and export | Manage users | Manage sources/secrets |
+| --- | --- | --- | --- | --- | --- |
+| Viewer | Yes | No | No | No | No |
+| Admin | Yes | Yes | Yes | Yes | No |
+| Owner | Yes | Yes | Yes | Yes | Yes |
 
 The JSON admin API remains available with `Authorization: Bearer $ADMIN_TOKEN`.
 The dashboard is available at `/admin`; all application secrets can be stored

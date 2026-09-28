@@ -214,11 +214,7 @@ async fn destination_failure_is_retried_then_delivered() {
     let delivery = db.claim_delivery().await.unwrap().unwrap();
     paystack_fanout::worker::process_one(&state, delivery).await;
     let event_id = db.list_events(None, None, None, None, 10, 0).await.unwrap()[0].id;
-    sqlx::query("UPDATE deliveries SET next_attempt_at = now() WHERE event_id = $1")
-        .bind(event_id)
-        .execute(&db.pool)
-        .await
-        .unwrap();
+    assert!(db.retry_now(event_id).await.unwrap());
     let delivery = db.claim_delivery().await.unwrap().unwrap();
     paystack_fanout::worker::process_one(&state, delivery).await;
     assert_eq!(
@@ -230,6 +226,7 @@ async fn destination_failure_is_retried_then_delivered() {
             .status,
         "delivered"
     );
+    assert!(!db.retry_now(event_id).await.unwrap());
     server.verify().await;
 }
 
