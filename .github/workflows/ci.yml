@@ -123,6 +123,7 @@ jobs:
           PAYSTACK_SECRET_KEY: sk_test_ci
           FANOUT_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
           COOKIE_SECURE: false
+          TRUST_PROXY: true
       - name: Wait for readiness
         run: timeout 60 bash -c 'until curl -fsS http://127.0.0.1:8080/readyz; do sleep 1; done'
       - name: Seed browser event
@@ -131,7 +132,7 @@ jobs:
           import hashlib, hmac, json, urllib.request
           body = json.dumps({"event": "charge.success", "data": {"reference": "tm_smoke_1", "metadata": {"app": "timamu"}}}).encode()
           signature = hmac.new(b"sk_test_ci", body, hashlib.sha512).hexdigest()
-          request = urllib.request.Request("http://127.0.0.1:8080/in/paystack_main", data=body, method="POST", headers={"content-type": "application/json", "x-paystack-signature": signature})
+          request = urllib.request.Request("http://127.0.0.1:8080/in/paystack_main", data=body, method="POST", headers={"content-type": "application/json", "x-paystack-signature": signature, "x-forwarded-for": "52.31.139.75"})
           with urllib.request.urlopen(request) as response:
               assert response.status == 200
           PY
