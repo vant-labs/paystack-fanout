@@ -3,14 +3,16 @@ use std::sync::Arc;
 use askama::Template;
 use axum::{
     Form, Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
@@ -30,6 +32,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/dashboard/events", get(events))
         .route("/dashboard/events/{id}", get(event_detail))
         .route("/dashboard/events/{id}/replay", post(replay))
+        .route("/dashboard/events/{id}/retry", post(retry_now))
+        .route("/dashboard/events/{id}/dead", post(move_to_dead))
+        .route("/dashboard/events/export.csv", get(export_csv))
+        .route("/dashboard/events/export.ndjson", get(export_ndjson))
         .route("/dashboard/retries", get(retries))
         .route("/dashboard/unrouted", get(unrouted))
         .route("/dashboard/audit", get(audit))
@@ -107,6 +113,15 @@ struct LoginForm {
 struct ReplayForm {
     csrf: String,
     route: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExportQuery {
+    status: Option<String>,
+    route: Option<String>,
+    event_type: Option<String>,
+    source: Option<String>,
+    raw: Option<bool>,
 }
 
 async fn login(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -402,6 +417,186 @@ async fn replay(
         )
             .into_response(),
         Err(error) => server_error(error),
+    }
+}
+
+async fn retry_now(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Form(form): Form<ReplayForm>,
+) -> Response {
+    let Some(user) = require_user(&state, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    if !user.can_write || !csrf_matches(&user.csrf_token, Some(&form.csrf)) {
+        return (StatusCode::FORBIDDEN, "Action not permitted").into_response();
+    }
+    match state.db.retry_now(id).await {
+        Ok(true) => {
+            let _ = state
+                .db
+                .audit(
+                    Some(user.id),
+                    "retry_now",
+                    Some("event"),
+                    Some(&id.to_string()),
+                    &Value::Null,
+                    None,
+                )
+                .await;
+            Redirect::to(&format!("/dashboard/events/{id}")).into_response()
+        }
+        Ok(false) => (
+            StatusCode::BAD_REQUEST,
+            "This event is not waiting for retry",
+        )
+            .into_response(),
+        Err(error) => server_error(error),
+    }
+}
+
+async fn move_to_dead(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Form(form): Form<ReplayForm>,
+) -> Response {
+    let Some(user) = require_user(&state, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    if !user.can_write || !csrf_matches(&user.csrf_token, Some(&form.csrf)) {
+        return (StatusCode::FORBIDDEN, "Action not permitted").into_response();
+    }
+    match state.db.move_to_dead(id).await {
+        Ok(true) => {
+            let _ = state
+                .db
+                .audit(
+                    Some(user.id),
+                    "move_to_dead",
+                    Some("event"),
+                    Some(&id.to_string()),
+                    &Value::Null,
+                    None,
+                )
+                .await;
+            Redirect::to(&format!("/dashboard/events/{id}")).into_response()
+        }
+        Ok(false) => (
+            StatusCode::BAD_REQUEST,
+            "This event cannot be moved to dead letters",
+        )
+            .into_response(),
+        Err(error) => server_error(error),
+    }
+}
+
+async fn export_csv(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ExportQuery>,
+) -> Response {
+    export_events(state, headers, query, false).await
+}
+
+async fn export_ndjson(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ExportQuery>,
+) -> Response {
+    export_events(state, headers, query, true).await
+}
+
+async fn export_events(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    query: ExportQuery,
+    ndjson: bool,
+) -> Response {
+    let Some(user) = require_user(&state, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    let _ = state
+        .db
+        .audit(
+            Some(user.id),
+            if ndjson {
+                "export_ndjson"
+            } else {
+                "export_csv"
+            },
+            Some("events"),
+            None,
+            &serde_json::json!({"raw": query.raw.unwrap_or(false)}),
+            None,
+        )
+        .await;
+    let include_raw = query.raw.unwrap_or(false);
+    let rows = state.db.clone().export_events(
+        query.status.clone(),
+        query.route.clone(),
+        query.event_type.clone(),
+        query.source.clone(),
+    );
+    let data = rows.map(move |row| match row {
+        Ok(row) => {
+            let id: Uuid = row.try_get("id").map_err(|error| std::io::Error::other(error.to_string()))?;
+            let source: String = row.try_get("source").map_err(|error| std::io::Error::other(error.to_string()))?;
+            let event_type: String = row.try_get("event_type").map_err(|error| std::io::Error::other(error.to_string()))?;
+            let route: Option<String> = row.try_get("matched_route").map_err(|error| std::io::Error::other(error.to_string()))?;
+            let status: String = row.try_get("status").map_err(|error| std::io::Error::other(error.to_string()))?;
+            let received_at: chrono::DateTime<chrono::Utc> = row.try_get("received_at").map_err(|error| std::io::Error::other(error.to_string()))?;
+            let delivered_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("delivered_at").map_err(|error| std::io::Error::other(error.to_string()))?;
+            let raw_body: Vec<u8> = row.try_get("raw_body").map_err(|error| std::io::Error::other(error.to_string()))?;
+            let output = if ndjson {
+                serde_json::to_vec(&serde_json::json!({"id": id, "source": source, "event_type": event_type, "route": route, "status": status, "received_at": received_at, "delivered_at": delivered_at, "raw_body": include_raw.then(|| String::from_utf8_lossy(&raw_body).into_owned())})).map_err(|error| std::io::Error::other(error.to_string()))?
+            } else {
+                let raw_text = if include_raw {
+                    String::from_utf8_lossy(&raw_body).into_owned()
+                } else {
+                    String::new()
+                };
+                let fields = [id.to_string(), source, event_type, route.unwrap_or_default(), status, received_at.to_rfc3339(), delivered_at.map(|value| value.to_rfc3339()).unwrap_or_default(), raw_text];
+                fields.iter().map(|field| csv_field(field)).collect::<Vec<_>>().join(",").into_bytes()
+            };
+            Ok::<Bytes, std::io::Error>(Bytes::from([output, b"\n".to_vec()].concat()))
+        }
+        Err(error) => Err(std::io::Error::other(error.to_string())),
+    });
+    let header_line = if ndjson {
+        Bytes::new()
+    } else {
+        Bytes::from_static(b"id,source,event_type,route,status,received_at,delivered_at,raw_body\n")
+    };
+    let stream =
+        futures_util::stream::once(async move { Ok::<Bytes, std::io::Error>(header_line) })
+            .chain(data);
+    let mut response = Body::from_stream(stream).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(if ndjson {
+            "application/x-ndjson"
+        } else {
+            "text/csv; charset=utf-8"
+        }),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static(if ndjson {
+            "attachment; filename=fanout-events.ndjson"
+        } else {
+            "attachment; filename=fanout-events.csv"
+        }),
+    );
+    response
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
     }
 }
 

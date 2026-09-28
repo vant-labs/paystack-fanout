@@ -167,6 +167,7 @@ input::placeholder { color: var(--text-muted); opacity: .75; }
 .facts dd { text-align: right; margin: 0; font-size: 12px; max-width: 62%; overflow-wrap: anywhere; }
 .stack-form { display: grid; gap: 8px; }
 .compact-form { border-top: 1px solid var(--border); margin-top: 14px; padding-top: 16px; }
+.detail-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
 .login-body { display: grid; place-items: center; min-height: 100vh; padding: 20px; background: radial-gradient(circle at top left, var(--blue-soft), var(--bg) 48%); }
 .login-card { width: min(100%, 410px); padding: 40px; background: var(--surface); border: 1px solid var(--border); border-radius: 18px; box-shadow: 0 24px 70px rgba(28, 42, 73, .12); }
 .login-brand { margin-bottom: 54px; }

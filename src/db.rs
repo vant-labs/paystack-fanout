@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use futures_util::Stream;
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
@@ -555,6 +556,51 @@ impl Database {
             }
         }
         Ok(count)
+    }
+
+    pub async fn retry_now(&self, event_id: Uuid) -> Result<bool> {
+        let result = sqlx::query("UPDATE deliveries SET status = 'pending', next_attempt_at = now(), locked_at = NULL WHERE event_id = $1 AND status IN ('retrying', 'dead')")
+            .bind(event_id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Ok(false);
+        }
+        sqlx::query("UPDATE events SET status = 'pending', delivered_at = NULL WHERE id = $1")
+            .bind(event_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(true)
+    }
+
+    pub async fn move_to_dead(&self, event_id: Uuid) -> Result<bool> {
+        let result = sqlx::query("UPDATE deliveries SET status = 'dead', locked_at = NULL WHERE event_id = $1 AND status IN ('pending', 'retrying')")
+            .bind(event_id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Ok(false);
+        }
+        sqlx::query("UPDATE events SET status = 'dead' WHERE id = $1")
+            .bind(event_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(true)
+    }
+
+    pub fn export_events(
+        self,
+        status: Option<String>,
+        route: Option<String>,
+        event_type: Option<String>,
+        source: Option<String>,
+    ) -> impl Stream<Item = std::result::Result<sqlx::postgres::PgRow, sqlx::Error>> + 'static {
+        sqlx::query("SELECT id, source, event_type, matched_route, status, received_at, delivered_at, raw_body FROM events WHERE ($1::text IS NULL OR status = $1) AND ($2::text IS NULL OR matched_route = $2) AND ($3::text IS NULL OR event_type = $3) AND ($4::text IS NULL OR source = $4) ORDER BY received_at DESC")
+            .bind(status)
+            .bind(route)
+            .bind(event_type)
+            .bind(source)
+            .fetch(&self.pool)
     }
 
     pub async fn prune_delivered(&self, retention_days: u32) -> Result<u64> {
