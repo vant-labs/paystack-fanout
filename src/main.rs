@@ -60,8 +60,11 @@ async fn main() -> Result<()> {
     db.migrate().await?;
     if let Some(Command::CreateOwner { email }) = args.command {
         anyhow::ensure!(db.user_count().await? == 0, "an owner already exists");
-        let password = rpassword::prompt_password("Owner password: ")?;
-        let confirmation = rpassword::prompt_password("Confirm password: ")?;
+        let password = std::env::var("FANOUT_OWNER_PASSWORD")
+            .unwrap_or_else(|_| rpassword::prompt_password("Owner password: ").unwrap_or_default());
+        let confirmation = std::env::var("FANOUT_OWNER_PASSWORD_CONFIRM").unwrap_or_else(|_| {
+            rpassword::prompt_password("Confirm password: ").unwrap_or_default()
+        });
         anyhow::ensure!(password == confirmation, "passwords do not match");
         let id = db.create_owner(&email, &hash_password(&password)?).await?;
         println!("Owner created: {id}");

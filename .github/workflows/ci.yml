@@ -113,6 +113,8 @@ jobs:
         env:
           DATABASE_URL: postgres://fanout:fanout@localhost:5432/fanout
           FANOUT_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          FANOUT_OWNER_PASSWORD: long secure password
+          FANOUT_OWNER_PASSWORD_CONFIRM: long secure password
       - name: Start service
         run: ./target/debug/paystack-fanout --role all --port 8080 &
         env:
