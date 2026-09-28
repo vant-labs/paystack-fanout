@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block title %}Audit log · Fanout{% endblock %}
+{% block content %}
+<header class="page-header"><div><div class="eyebrow">Governance</div><h1>Audit log</h1><p class="muted">A durable record of console actions.</p></div></header>
+<section class="panel">{% if entries.is_empty() %}<div class="empty-state"><div class="empty-icon">⌁</div><h3>No activity yet</h3><p>Sign-ins and operational actions will appear here.</p></div>{% else %}<div class="table-wrap"><table><thead><tr><th>When</th><th>Action</th><th>Target</th><th>Remote address</th><th>Details</th></tr></thead><tbody>{% for entry in entries %}<tr><td>{{ entry.created_at }}</td><td><span class="pill pill-neutral">{{ entry.action }}</span></td><td>{{ entry.target_type.as_deref().unwrap_or("—") }} {{ entry.target_id.as_deref().unwrap_or("") }}</td><td>{{ entry.remote_addr.as_deref().unwrap_or("—") }}</td><td>{{ entry.metadata }}</td></tr>{% endfor %}</tbody></table></div>{% endif %}</section>
+{% endblock %}

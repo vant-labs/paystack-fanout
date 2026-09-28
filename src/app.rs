@@ -1,6 +1,8 @@
 use std::{
+    collections::HashMap,
     net::{IpAddr, SocketAddr},
     sync::Arc,
+    time::Instant,
 };
 
 use axum::{
@@ -34,6 +36,8 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub trust_proxy: bool,
     pub admin_token: Option<String>,
+    pub cookie_secure: bool,
+    pub login_limits: Arc<std::sync::Mutex<HashMap<String, (u32, Instant)>>>,
     alert_url_override: Option<String>,
 }
 
@@ -57,6 +61,10 @@ impl AppState {
             trust_proxy: std::env::var("TRUST_PROXY")
                 .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
             admin_token: std::env::var("ADMIN_TOKEN").ok(),
+            cookie_secure: std::env::var("COOKIE_SECURE")
+                .map(|value| !value.eq_ignore_ascii_case("false"))
+                .unwrap_or(true),
+            login_limits: Arc::new(std::sync::Mutex::new(HashMap::new())),
             alert_url_override,
         })
     }
@@ -83,6 +91,7 @@ impl AppState {
 
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
+        .merge(crate::dashboard::router())
         .route("/in/{source}", post(ingest))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -180,6 +189,12 @@ async fn ingest(
             &stored_headers,
             &dedupe,
             matched_route,
+            Some(match decision.source {
+                MatchSource::MetadataApp => "metadata.app",
+                MatchSource::PlanCode => "plan_code",
+                MatchSource::Reference => "reference",
+                MatchSource::Fallback => "fallback",
+            }),
             status,
             decision
                 .route

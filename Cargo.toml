@@ -11,6 +11,8 @@ readme = "README.md"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+argon2 = "0.5"
+askama = "0.12"
 axum = { version = "0.8", features = ["macros"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
@@ -23,6 +25,7 @@ hyper = "1"
 ipnet = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rand = "0.9"
+rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

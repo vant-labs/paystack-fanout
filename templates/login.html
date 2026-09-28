@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Sign in · Fanout</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body class="login-body">
+  <main class="login-card" aria-labelledby="login-title">
+    <div class="brand login-brand"><span class="brand-mark">F</span><span>fanout<span class="brand-dot">.</span></span></div>
+    <div class="eyebrow">Operations console</div>
+    <h1 id="login-title">Welcome back</h1>
+    <p class="muted">Sign in to inspect deliveries and keep your products moving.</p>
+    {% if let Some(message) = error %}<div class="alert alert-error" role="alert">{{ message }}</div>{% endif %}
+    <form method="post" action="/login" class="stack-form">
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" autocomplete="username" required autofocus>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <button class="button button-primary button-wide" type="submit">Sign in</button>
+    </form>
+    <button class="theme-button login-theme" type="button" data-theme-toggle aria-label="Toggle color theme"><span data-theme-icon>☼</span><span>Toggle theme</span></button>
+  </main>
+</body>
+</html>

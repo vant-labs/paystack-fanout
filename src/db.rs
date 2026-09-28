@@ -7,6 +7,7 @@ use serde_json::Value;
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use uuid::Uuid;
 
+use crate::auth::{Role, SessionUser, token_hash};
 use crate::config::Config;
 
 #[derive(Clone)]
@@ -25,7 +26,7 @@ pub struct ClaimedDelivery {
     pub destination_url: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EventSummary {
     pub id: Uuid,
     pub source: String,
@@ -36,7 +37,7 @@ pub struct EventSummary {
     pub delivered_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AttemptView {
     pub attempt: i32,
     pub started_at: DateTime<Utc>,
@@ -47,10 +48,45 @@ pub struct AttemptView {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EventDetail {
     pub summary: EventSummary,
+    pub raw_body: String,
+    pub headers: Value,
+    pub routing_reason: Option<String>,
     pub attempts: Vec<AttemptView>,
+}
+
+#[derive(Debug)]
+pub struct UserRecord {
+    pub id: Uuid,
+    pub email: String,
+    pub password_hash: String,
+    pub role: Role,
+    pub disabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuditEntry {
+    pub id: i64,
+    pub action: String,
+    pub target_type: Option<String>,
+    pub target_id: Option<String>,
+    pub metadata: Value,
+    pub remote_addr: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OverviewStats {
+    pub received_24h: i64,
+    pub received_7d: i64,
+    pub delivered_24h: i64,
+    pub retrying: i64,
+    pub dead: i64,
+    pub unrouted: i64,
+    pub total_with_delivery: i64,
+    pub delivered_with_delivery: i64,
 }
 
 impl Database {
@@ -72,6 +108,167 @@ impl Database {
         Ok(())
     }
 
+    pub async fn user_count(&self) -> Result<i64> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    pub async fn create_owner(&self, email: &str, password_hash: &str) -> Result<Uuid> {
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO users (id, email, password_hash, role, created_at) VALUES ($1, $2, $3, 'owner', now())")
+            .bind(id)
+            .bind(email.trim().to_ascii_lowercase())
+            .bind(password_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(id)
+    }
+
+    pub async fn find_user_by_email(&self, email: &str) -> Result<Option<UserRecord>> {
+        let row = sqlx::query("SELECT id, email, password_hash, role, disabled FROM users WHERE lower(email) = lower($1)")
+            .bind(email.trim())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| -> Result<UserRecord, sqlx::Error> {
+            Ok(UserRecord {
+                id: row.try_get("id")?,
+                email: row.try_get("email")?,
+                password_hash: row.try_get("password_hash")?,
+                role: Role::parse(row.try_get::<String, _>("role")?.as_str())
+                    .ok_or_else(|| sqlx::Error::Protocol("invalid user role".into()))?,
+                disabled: row.try_get("disabled")?,
+            })
+        })
+        .transpose()
+        .map_err(Into::into)
+    }
+
+    pub async fn mark_login(&self, user_id: Uuid) -> Result<()> {
+        sqlx::query("UPDATE users SET last_login_at = now() WHERE id = $1")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn create_session(&self, user_id: Uuid, token: &str, csrf_token: &str) -> Result<()> {
+        sqlx::query("INSERT INTO sessions (id, token_hash, user_id, csrf_token, created_at, expires_at, last_seen_at) VALUES ($1, $2, $3, $4, now(), now() + interval '14 days', now())")
+            .bind(Uuid::new_v4())
+            .bind(token_hash(token))
+            .bind(user_id)
+            .bind(csrf_token)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn session_user(&self, token: &str) -> Result<Option<SessionUser>> {
+        let row = sqlx::query("SELECT s.user_id, u.email, u.role, s.csrf_token FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = $1 AND s.expires_at > now() AND u.disabled = false")
+            .bind(token_hash(token))
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| -> Result<SessionUser, sqlx::Error> {
+            Ok(SessionUser {
+                id: row.try_get("user_id")?,
+                email: row.try_get("email")?,
+                initial: row
+                    .try_get::<String, _>("email")?
+                    .chars()
+                    .next()
+                    .unwrap_or('?')
+                    .to_ascii_uppercase()
+                    .to_string(),
+                role: Role::parse(row.try_get::<String, _>("role")?.as_str())
+                    .ok_or_else(|| sqlx::Error::Protocol("invalid user role".into()))?,
+                can_write: Role::parse(row.try_get::<String, _>("role")?.as_str())
+                    .is_some_and(Role::can_write),
+                csrf_token: row.try_get("csrf_token")?,
+                session_token: token.to_owned(),
+            })
+        })
+        .transpose()
+        .map_err(Into::into)
+    }
+
+    pub async fn touch_session(&self, token: &str) -> Result<()> {
+        sqlx::query("UPDATE sessions SET last_seen_at = now() WHERE token_hash = $1")
+            .bind(token_hash(token))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_session(&self, token: &str) -> Result<()> {
+        sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
+            .bind(token_hash(token))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn audit(
+        &self,
+        user_id: Option<Uuid>,
+        action: &str,
+        target_type: Option<&str>,
+        target_id: Option<&str>,
+        metadata: &Value,
+        remote_addr: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query("INSERT INTO audit_logs (user_id, action, target_type, target_id, metadata, remote_addr, created_at) VALUES ($1, $2, $3, $4, $5, $6, now())")
+            .bind(user_id)
+            .bind(action)
+            .bind(target_type)
+            .bind(target_id)
+            .bind(metadata)
+            .bind(remote_addr)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_audit(&self, limit: i64, offset: i64) -> Result<Vec<AuditEntry>> {
+        let rows = sqlx::query("SELECT id, action, target_type, target_id, metadata, remote_addr, created_at FROM audit_logs ORDER BY created_at DESC LIMIT $1 OFFSET $2")
+            .bind(limit.clamp(1, 100))
+            .bind(offset.max(0))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(AuditEntry {
+                    id: row.try_get("id")?,
+                    action: row.try_get("action")?,
+                    target_type: row.try_get("target_type")?,
+                    target_id: row.try_get("target_id")?,
+                    metadata: row.try_get("metadata")?,
+                    remote_addr: row.try_get("remote_addr")?,
+                    created_at: row.try_get("created_at")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(Into::into)
+    }
+
+    pub async fn overview_stats(&self) -> Result<OverviewStats> {
+        let row = sqlx::query("SELECT COUNT(*) FILTER (WHERE received_at >= now() - interval '24 hours') AS received_24h, COUNT(*) FILTER (WHERE received_at >= now() - interval '7 days') AS received_7d, COUNT(*) FILTER (WHERE status = 'delivered' AND received_at >= now() - interval '24 hours') AS delivered_24h, COUNT(*) FILTER (WHERE status = 'retrying') AS retrying, COUNT(*) FILTER (WHERE status = 'dead') AS dead, COUNT(*) FILTER (WHERE status = 'unrouted') AS unrouted FROM events")
+            .fetch_one(&self.pool)
+            .await?;
+        let delivery_row = sqlx::query("SELECT COUNT(*) AS total_with_delivery, COUNT(*) FILTER (WHERE status = 'delivered') AS delivered_with_delivery FROM deliveries")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(OverviewStats {
+            received_24h: row.try_get("received_24h")?,
+            received_7d: row.try_get("received_7d")?,
+            delivered_24h: row.try_get("delivered_24h")?,
+            retrying: row.try_get("retrying")?,
+            dead: row.try_get("dead")?,
+            unrouted: row.try_get("unrouted")?,
+            total_with_delivery: delivery_row.try_get("total_with_delivery")?,
+            delivered_with_delivery: delivery_row.try_get("delivered_with_delivery")?,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_event(
         &self,
@@ -83,6 +280,7 @@ impl Database {
         headers: &Value,
         dedupe_key: &str,
         matched_route: Option<&str>,
+        routing_reason: Option<&str>,
         status: &str,
         destination_url: Option<&str>,
     ) -> Result<InsertResult> {
@@ -90,21 +288,22 @@ impl Database {
         let delivery_id = Uuid::new_v4();
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
-        let inserted = sqlx::query!(
-            r#"INSERT INTO events (id, source, event_type, raw_body, content_type, signature, headers, dedupe_key, matched_route, status, received_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (source, dedupe_key) DO NOTHING"#,
-            event_id,
-            source,
-            event_type,
-            raw_body,
-            content_type,
-            signature,
-            headers,
-            dedupe_key,
-            matched_route,
-            status,
-            now,
+        let inserted = sqlx::query(
+            r#"INSERT INTO events (id, source, event_type, raw_body, content_type, signature, headers, dedupe_key, matched_route, routing_reason, status, received_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (source, dedupe_key) DO NOTHING"#,
         )
+        .bind(event_id)
+        .bind(source)
+        .bind(event_type)
+        .bind(raw_body)
+        .bind(content_type)
+        .bind(signature)
+        .bind(headers)
+        .bind(dedupe_key)
+        .bind(matched_route)
+        .bind(routing_reason)
+        .bind(status)
+        .bind(now)
         .execute(&mut *tx)
         .await?;
         if inserted.rows_affected() == 0 {
@@ -257,7 +456,7 @@ impl Database {
     }
 
     pub async fn get_event(&self, event_id: Uuid) -> Result<Option<EventDetail>> {
-        let Some(row) = sqlx::query("SELECT id, source, event_type, matched_route, status, received_at, delivered_at FROM events WHERE id = $1").bind(event_id).fetch_optional(&self.pool).await? else { return Ok(None) };
+        let Some(row) = sqlx::query("SELECT id, source, event_type, raw_body, headers, routing_reason, matched_route, status, received_at, delivered_at FROM events WHERE id = $1").bind(event_id).fetch_optional(&self.pool).await? else { return Ok(None) };
         let summary = EventSummary {
             id: row.try_get("id")?,
             source: row.try_get("source")?,
@@ -267,6 +466,9 @@ impl Database {
             received_at: row.try_get("received_at")?,
             delivered_at: row.try_get("delivered_at")?,
         };
+        let raw_body: Vec<u8> = row.try_get("raw_body")?;
+        let headers: Value = row.try_get("headers")?;
+        let routing_reason: Option<String> = row.try_get("routing_reason")?;
         let rows = sqlx::query("SELECT da.attempt, da.started_at, da.finished_at, da.status_code, da.latency_ms, da.response_body, da.error FROM delivery_attempts da JOIN deliveries d ON d.id = da.delivery_id WHERE d.event_id = $1 ORDER BY da.attempt").bind(event_id).fetch_all(&self.pool).await?;
         let attempts = rows
             .into_iter()
@@ -282,7 +484,13 @@ impl Database {
                 })
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()?;
-        Ok(Some(EventDetail { summary, attempts }))
+        Ok(Some(EventDetail {
+            summary,
+            raw_body: String::from_utf8_lossy(&raw_body).into_owned(),
+            headers,
+            routing_reason,
+            attempts,
+        }))
     }
 
     pub async fn replay(

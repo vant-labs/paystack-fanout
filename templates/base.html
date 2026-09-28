@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>{% block title %}Fanout Console{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/htmx-2.0.6.min.js" defer></script>
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar" aria-label="Primary navigation">
+      <a class="brand" href="/admin"><span class="brand-mark">F</span><span>fanout<span class="brand-dot">.</span></span></a>
+      <div class="nav-label">Workspace</div>
+      <nav class="nav-list">
+        <a class="nav-link" href="/admin"><span>Overview</span></a>
+        <a class="nav-link" href="/dashboard/events"><span>Events</span></a>
+        <a class="nav-link" href="/dashboard/retries"><span>Retries</span></a>
+        <a class="nav-link" href="/dashboard/unrouted"><span>Unrouted</span></a>
+        <a class="nav-link" href="/dashboard/audit"><span>Audit log</span></a>
+      </nav>
+      <div class="sidebar-bottom">
+        <button class="theme-button" type="button" data-theme-toggle aria-label="Toggle color theme"><span data-theme-icon>☼</span><span>Theme</span></button>
+        <div class="user-card"><div class="avatar">{{ user.initial }}</div><div class="user-meta"><strong>{{ user.email }}</strong><span>{{ user.role }}</span></div></div>
+        <form method="post" action="/logout"><button class="signout" type="submit">Sign out</button></form>
+      </div>
+    </aside>
+    <main class="main-content">
+      <div class="mobile-topbar"><a class="brand" href="/admin"><span class="brand-mark">F</span><span>fanout<span class="brand-dot">.</span></span></a><button class="theme-button" type="button" data-theme-toggle aria-label="Toggle color theme">☼</button></div>
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</body>
+</html>
