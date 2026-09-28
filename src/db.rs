@@ -66,6 +66,18 @@ pub struct UserRecord {
     pub password_hash: String,
     pub role: Role,
     pub disabled: bool,
+    pub totp_secret: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserView {
+    pub id: Uuid,
+    pub email: String,
+    pub role: Role,
+    pub disabled: bool,
+    pub totp_enabled: bool,
+    pub last_login_at: Option<DateTime<Utc>>,
+    pub last_login_label: String,
 }
 
 #[derive(Debug, Clone)]
@@ -232,7 +244,80 @@ impl Database {
                 })
                 .collect();
         }
+        if let Ok(rows) = sqlx::query("SELECT key, value FROM settings")
+            .fetch_all(&self.pool)
+            .await
+        {
+            for row in rows {
+                let key: String = match row.try_get("key") {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let value: Value = match row.try_get("value") {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                match key.as_str() {
+                    "retention_days" => {
+                        if let Some(days) = value.as_u64().and_then(|days| u32::try_from(days).ok())
+                        {
+                            config.retention_days = days;
+                        }
+                    }
+                    "fallback_mode" => {
+                        if let Some(mode) = value.as_str() {
+                            config.fallback = crate::config::FallbackConfig {
+                                mode: mode.to_owned(),
+                            };
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         (config, secrets)
+    }
+
+    pub async fn alert_url_setting(&self) -> Option<String> {
+        let row = sqlx::query("SELECT value FROM settings WHERE key = 'alert_webhook_url'")
+            .fetch_optional(&self.pool)
+            .await
+            .ok()??;
+        let value: Value = row.try_get("value").ok()?;
+        decrypt(value.as_str()?).ok()
+    }
+
+    pub async fn save_settings(
+        &self,
+        retention_days: u32,
+        fallback_mode: &str,
+        alert_url: Option<&str>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            (1..=3_650).contains(&retention_days),
+            "retention must be between 1 and 3650 days"
+        );
+        anyhow::ensure!(
+            fallback_mode == "unrouted" || fallback_mode.starts_with("route:"),
+            "invalid fallback mode"
+        );
+        for (key, value) in [
+            ("retention_days", serde_json::json!(retention_days)),
+            ("fallback_mode", serde_json::json!(fallback_mode)),
+        ] {
+            sqlx::query("INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()")
+                .bind(key)
+                .bind(value)
+                .execute(&self.pool)
+                .await?;
+        }
+        if let Some(alert_url) = alert_url.filter(|value| !value.trim().is_empty()) {
+            sqlx::query("INSERT INTO settings (key, value, updated_at) VALUES ('alert_webhook_url', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()")
+                .bind(serde_json::json!(encrypt(alert_url)?))
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn list_sources(&self) -> Result<Vec<SourceView>> {
@@ -335,7 +420,7 @@ impl Database {
     }
 
     pub async fn find_user_by_email(&self, email: &str) -> Result<Option<UserRecord>> {
-        let row = sqlx::query("SELECT id, email, password_hash, role, disabled FROM users WHERE lower(email) = lower($1)")
+        let row = sqlx::query("SELECT id, email, password_hash, role, disabled, totp_secret FROM users WHERE lower(email) = lower($1)")
             .bind(email.trim())
             .fetch_optional(&self.pool)
             .await?;
@@ -347,6 +432,7 @@ impl Database {
                 role: Role::parse(row.try_get::<String, _>("role")?.as_str())
                     .ok_or_else(|| sqlx::Error::Protocol("invalid user role".into()))?,
                 disabled: row.try_get("disabled")?,
+                totp_secret: row.try_get("totp_secret")?,
             })
         })
         .transpose()
@@ -359,6 +445,60 @@ impl Database {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    pub async fn list_users(&self) -> Result<Vec<UserView>> {
+        let rows = sqlx::query("SELECT id, email, role, disabled, totp_secret IS NOT NULL AS totp_enabled, last_login_at FROM users ORDER BY lower(email)")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let role = Role::parse(row.try_get::<String, _>("role")?.as_str())
+                    .ok_or_else(|| sqlx::Error::Protocol("invalid user role".into()))?;
+                let last_login_at: Option<DateTime<Utc>> = row.try_get("last_login_at")?;
+                Ok(UserView {
+                    id: row.try_get("id")?,
+                    email: row.try_get("email")?,
+                    role,
+                    disabled: row.try_get("disabled")?,
+                    totp_enabled: row.try_get("totp_enabled")?,
+                    last_login_label: last_login_at
+                        .map(|value| value.to_rfc3339())
+                        .unwrap_or_else(|| "Never".to_owned()),
+                    last_login_at,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(Into::into)
+    }
+
+    pub async fn create_user(&self, email: &str, password_hash: &str, role: Role) -> Result<Uuid> {
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO users (id, email, password_hash, role, created_at) VALUES ($1, $2, $3, $4, now())")
+            .bind(id)
+            .bind(email.trim().to_ascii_lowercase())
+            .bind(password_hash)
+            .bind(role.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(id)
+    }
+
+    pub async fn set_user_disabled(&self, id: Uuid, disabled: bool) -> Result<bool> {
+        let result = sqlx::query("UPDATE users SET disabled = $2 WHERE id = $1")
+            .bind(id)
+            .bind(disabled)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn reset_totp(&self, id: Uuid) -> Result<bool> {
+        let result = sqlx::query("UPDATE users SET totp_secret = NULL WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn create_session(&self, user_id: Uuid, token: &str, csrf_token: &str) -> Result<()> {

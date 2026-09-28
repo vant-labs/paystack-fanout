@@ -40,6 +40,7 @@ pub struct AppState {
     pub login_limits: Arc<std::sync::Mutex<HashMap<String, (u32, Instant)>>>,
     pub runtime_config: Arc<tokio::sync::RwLock<Config>>,
     pub runtime_secrets: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
+    pub runtime_alert_url: Arc<tokio::sync::RwLock<Option<String>>>,
     alert_url_override: Option<String>,
 }
 
@@ -70,6 +71,7 @@ impl AppState {
             login_limits: Arc::new(std::sync::Mutex::new(HashMap::new())),
             runtime_config: Arc::new(tokio::sync::RwLock::new(runtime_config)),
             runtime_secrets: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            runtime_alert_url: Arc::new(tokio::sync::RwLock::new(None)),
             alert_url_override,
         })
     }
@@ -78,6 +80,7 @@ impl AppState {
         let (config, secrets) = self.db.load_runtime_config(&self.config).await;
         *self.runtime_config.write().await = config;
         *self.runtime_secrets.write().await = secrets;
+        *self.runtime_alert_url.write().await = self.db.alert_url_setting().await;
         Ok(())
     }
 
@@ -85,6 +88,12 @@ impl AppState {
         let Some(url) = self
             .alert_url_override
             .clone()
+            .or_else(|| {
+                self.runtime_alert_url
+                    .try_read()
+                    .ok()
+                    .and_then(|value| value.clone())
+            })
             .or_else(|| self.config.alert_url())
         else {
             return;
@@ -432,7 +441,8 @@ fn admin_ok(state: &AppState, headers: &HeaderMap) -> bool {
 
 pub async fn retention_loop(state: Arc<AppState>) {
     loop {
-        if let Err(error) = state.db.prune_delivered(state.config.retention_days).await {
+        let retention_days = state.runtime_config.read().await.retention_days;
+        if let Err(error) = state.db.prune_delivered(retention_days).await {
             tracing::error!(error = %error, "retention cleanup failed");
         }
         sleep(Duration::from_secs(86_400)).await;

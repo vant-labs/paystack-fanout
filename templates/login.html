@@ -20,6 +20,8 @@
       <input id="email" name="email" type="email" autocomplete="username" required autofocus>
       <label for="password">Password</label>
       <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <label for="totp_code">Authenticator code <span class="muted">if enabled</span></label>
+      <input id="totp_code" name="totp_code" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="123456">
       <button class="button button-primary button-wide" type="submit">Sign in</button>
     </form>
     <button class="theme-button login-theme" type="button" data-theme-toggle aria-label="Toggle color theme"><span data-theme-icon>☼</span><span>Toggle theme</span></button>

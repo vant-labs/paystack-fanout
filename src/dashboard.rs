@@ -18,12 +18,12 @@ use uuid::Uuid;
 use crate::{
     app::AppState,
     auth::{
-        SessionUser, clear_session_cookie, csrf_matches, random_token, session_cookie,
-        session_token, verify_password,
+        Role, SessionUser, clear_session_cookie, csrf_matches, hash_password, random_token,
+        session_cookie, session_token, verify_password, verify_totp,
     },
     config::RouteMatcher,
     db::{AuditEntry, EventDetail, EventSummary, OverviewStats},
-    db::{RouteView, SourceView},
+    db::{RouteView, SourceView, UserView},
 };
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -45,6 +45,11 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/dashboard/config/route", post(save_route))
         .route("/dashboard/config/source", post(save_source))
         .route("/dashboard/config/test-route", post(test_route))
+        .route("/dashboard/users", get(users))
+        .route("/dashboard/users/create", post(create_user))
+        .route("/dashboard/users/{id}/disable", post(disable_user))
+        .route("/dashboard/users/{id}/reset-2fa", post(reset_2fa))
+        .route("/dashboard/settings", get(settings).post(save_settings))
         .route("/static/{*path}", get(static_asset))
 }
 
@@ -58,6 +63,7 @@ struct LoginPage {
 #[template(path = "overview.html")]
 struct OverviewPage {
     user: SessionUser,
+    csrf: String,
     stats: OverviewStats,
     signature_failures: u64,
     success_rate: String,
@@ -88,6 +94,7 @@ struct EventsPage {
     user: SessionUser,
     events: Vec<EventSummary>,
     filters: EventFilters,
+    csrf: String,
     title: String,
     empty_message: String,
 }
@@ -107,6 +114,7 @@ struct EventDetailPage {
 struct AuditPage {
     user: SessionUser,
     entries: Vec<AuditEntry>,
+    csrf: String,
 }
 
 #[derive(Debug, Clone, Template)]
@@ -121,10 +129,30 @@ struct ConfigurationPage {
     test_result: Option<String>,
 }
 
+#[derive(Debug, Clone, Template)]
+#[template(path = "users.html")]
+struct UsersPage {
+    user: SessionUser,
+    users: Vec<UserView>,
+    csrf: String,
+}
+
+#[derive(Debug, Clone, Template)]
+#[template(path = "settings.html")]
+struct SettingsPage {
+    user: SessionUser,
+    csrf: String,
+    retention_days: u32,
+    fallback_mode: String,
+    fallback_options: Vec<String>,
+    alert_present: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct LoginForm {
     email: String,
     password: String,
+    totp_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,6 +189,27 @@ struct TestRouteForm {
     csrf: String,
     route: String,
     payload: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateUserForm {
+    csrf: String,
+    email: String,
+    password: String,
+    role: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UserActionForm {
+    csrf: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SettingsForm {
+    csrf: String,
+    retention_days: u32,
+    fallback_mode: String,
+    alert_webhook_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,9 +253,15 @@ async fn login_submit(
             });
         }
     };
-    let valid = user
-        .as_ref()
-        .is_some_and(|user| !user.disabled && verify_password(&form.password, &user.password_hash));
+    let valid = user.as_ref().is_some_and(|user| {
+        !user.disabled
+            && verify_password(&form.password, &user.password_hash)
+            && user.totp_secret.as_deref().is_none_or(|secret| {
+                form.totp_code.as_deref().is_some_and(|code| {
+                    verify_totp(secret, code, chrono::Utc::now().timestamp().max(0) as u64)
+                })
+            })
+    });
     if !valid {
         login_failed(&state, &key);
         return render(LoginPage {
@@ -252,10 +307,22 @@ async fn login_submit(
     response
 }
 
-async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+#[derive(Debug, Deserialize)]
+struct LogoutForm {
+    csrf: String,
+}
+
+async fn logout(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<LogoutForm>,
+) -> Response {
     let token = session_token(&headers);
     if let Some(token) = token.as_deref() {
         if let Ok(Some(user)) = state.db.session_user(token).await {
+            if !csrf_matches(&user.csrf_token, Some(&form.csrf)) {
+                return (StatusCode::FORBIDDEN, "Action not permitted").into_response();
+            }
             let _ = state
                 .db
                 .audit(
@@ -304,6 +371,7 @@ async fn overview(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
     };
     render(OverviewPage {
         user,
+        csrf: current_csrf(&state, &headers).await.unwrap_or_default(),
         stats,
         signature_failures: state
             .metrics
@@ -346,6 +414,7 @@ async fn events(
         }
         .to_owned(),
         title: "Events".to_owned(),
+        csrf: current_csrf(&state, &headers).await.unwrap_or_default(),
         events,
         filters,
     })
@@ -371,6 +440,7 @@ async fn retries(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
         user,
         events,
         filters,
+        csrf: current_csrf(&state, &headers).await.unwrap_or_default(),
         title: "Retries and dead letters".to_owned(),
         empty_message: "The delivery queue is clear.".to_owned(),
     })
@@ -396,6 +466,7 @@ async fn unrouted(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
         user,
         events,
         filters,
+        csrf: current_csrf(&state, &headers).await.unwrap_or_default(),
         title: "Unrouted".to_owned(),
         empty_message: "Every event is currently assigned to a route.".to_owned(),
     })
@@ -654,9 +725,216 @@ async fn audit(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
         return Redirect::to("/login").into_response();
     };
     match state.db.list_audit(100, 0).await {
-        Ok(entries) => render(AuditPage { user, entries }),
+        Ok(entries) => render(AuditPage {
+            user,
+            entries,
+            csrf: current_csrf(&state, &headers).await.unwrap_or_default(),
+        }),
         Err(error) => server_error(error),
     }
+}
+
+async fn users(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let Some(user) = require_user(&state, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    if !user.role.can_manage() {
+        return (StatusCode::FORBIDDEN, "Owner access is required").into_response();
+    }
+    match state.db.list_users().await {
+        Ok(users) => render(UsersPage {
+            user,
+            users,
+            csrf: current_csrf(&state, &headers).await.unwrap_or_default(),
+        }),
+        Err(error) => server_error(error),
+    }
+}
+
+async fn create_user(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<CreateUserForm>,
+) -> Response {
+    let Some(user) = require_user(&state, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    if !user.role.can_manage() || !csrf_matches(&user.csrf_token, Some(&form.csrf)) {
+        return (StatusCode::FORBIDDEN, "Owner access is required").into_response();
+    }
+    let Some(role) = Role::parse(&form.role) else {
+        return (StatusCode::BAD_REQUEST, "Invalid role").into_response();
+    };
+    if role == Role::Owner {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Only the first account is created as owner",
+        )
+            .into_response();
+    }
+    if form.email.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "Email is required").into_response();
+    }
+    let password_hash = match hash_password(&form.password) {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    match state
+        .db
+        .create_user(&form.email, &password_hash, role)
+        .await
+    {
+        Ok(id) => {
+            let _ = state
+                .db
+                .audit(
+                    Some(user.id),
+                    "user_create",
+                    Some("user"),
+                    Some(&id.to_string()),
+                    &serde_json::json!({"role": role.to_string()}),
+                    None,
+                )
+                .await;
+            Redirect::to("/dashboard/users").into_response()
+        }
+        Err(error) => server_error(error),
+    }
+}
+
+async fn disable_user(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Form(form): Form<UserActionForm>,
+) -> Response {
+    let Some(user) = require_user(&state, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    if !user.role.can_manage() || !csrf_matches(&user.csrf_token, Some(&form.csrf)) {
+        return (StatusCode::FORBIDDEN, "Owner access is required").into_response();
+    }
+    if id == user.id {
+        return (
+            StatusCode::BAD_REQUEST,
+            "The current owner cannot be disabled",
+        )
+            .into_response();
+    }
+    match state.db.set_user_disabled(id, true).await {
+        Ok(true) => {
+            let _ = state
+                .db
+                .audit(
+                    Some(user.id),
+                    "user_disable",
+                    Some("user"),
+                    Some(&id.to_string()),
+                    &Value::Null,
+                    None,
+                )
+                .await;
+            Redirect::to("/dashboard/users").into_response()
+        }
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(error),
+    }
+}
+
+async fn reset_2fa(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Form(form): Form<UserActionForm>,
+) -> Response {
+    let Some(user) = require_user(&state, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    if !user.role.can_manage() || !csrf_matches(&user.csrf_token, Some(&form.csrf)) {
+        return (StatusCode::FORBIDDEN, "Owner access is required").into_response();
+    }
+    match state.db.reset_totp(id).await {
+        Ok(true) => {
+            let _ = state
+                .db
+                .audit(
+                    Some(user.id),
+                    "user_reset_2fa",
+                    Some("user"),
+                    Some(&id.to_string()),
+                    &Value::Null,
+                    None,
+                )
+                .await;
+            Redirect::to("/dashboard/users").into_response()
+        }
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(error),
+    }
+}
+
+async fn settings(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let Some(user) = require_user(&state, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    let config = state.runtime_config.read().await.clone();
+    let mut fallback_options = vec!["unrouted".to_owned()];
+    fallback_options.extend(
+        config
+            .route
+            .iter()
+            .map(|route| format!("route:{}", route.name)),
+    );
+    render(SettingsPage {
+        user,
+        csrf: current_csrf(&state, &headers).await.unwrap_or_default(),
+        retention_days: config.retention_days,
+        fallback_mode: config.fallback.mode,
+        fallback_options,
+        alert_present: state.runtime_alert_url.read().await.is_some(),
+    })
+}
+
+async fn save_settings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<SettingsForm>,
+) -> Response {
+    let Some(user) = require_user(&state, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    if !user.can_write || !csrf_matches(&user.csrf_token, Some(&form.csrf)) {
+        return (StatusCode::FORBIDDEN, "Action not permitted").into_response();
+    }
+    if let Err(error) = state
+        .db
+        .save_settings(
+            form.retention_days,
+            &form.fallback_mode,
+            form.alert_webhook_url.as_deref(),
+        )
+        .await
+    {
+        return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+    }
+    if let Err(error) = state.reload_runtime_config().await {
+        return server_error(error);
+    }
+    let _ = state
+        .db
+        .audit(
+            Some(user.id),
+            "settings_edit",
+            Some("settings"),
+            None,
+            &serde_json::json!({
+                "retention_days": form.retention_days,
+                "fallback_mode": form.fallback_mode
+            }),
+            None,
+        )
+        .await;
+    Redirect::to("/dashboard/settings").into_response()
 }
 
 async fn configuration(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {

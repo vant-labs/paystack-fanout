@@ -179,8 +179,14 @@ input::placeholder { color: var(--text-muted); opacity: .75; }
 .check-label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
 .check-label input { width: auto; }
 .payload-input { width: 100%; resize: vertical; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface); color: var(--text); padding: 10px; font-family: ui-monospace, monospace; font-size: 12px; }
+.inline-actions { display: flex; gap: 10px; }
+.text-button { border: 0; padding: 0; background: transparent; color: var(--brand); cursor: pointer; font-size: 11px; font-weight: 700; }
+.text-button:hover { text-decoration: underline; }
 .alert-success { color: var(--green); background: var(--green-soft); border: 1px solid color-mix(in srgb, var(--green) 25%, transparent); }
 .alert-info { color: var(--brand); background: var(--blue-soft); border: 1px solid color-mix(in srgb, var(--brand) 25%, transparent); }
+.alert-warning { color: var(--amber); background: var(--amber-soft); border: 1px solid color-mix(in srgb, var(--amber) 25%, transparent); }
+.settings-form { max-width: 620px; }
+.settings-note { font-size: 12px; }
 .login-body { display: grid; place-items: center; min-height: 100vh; padding: 20px; background: radial-gradient(circle at top left, var(--blue-soft), var(--bg) 48%); }
 .login-card { width: min(100%, 410px); padding: 40px; background: var(--surface); border: 1px solid var(--border); border-radius: 18px; box-shadow: 0 24px 70px rgba(28, 42, 73, .12); }
 .login-brand { margin-bottom: 54px; }

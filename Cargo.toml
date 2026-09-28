@@ -16,6 +16,7 @@ argon2 = "0.5"
 askama = "0.12"
 axum = { version = "0.8", features = ["macros"] }
 base64 = "0.22"
+data-encoding = "2"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 hmac = "0.12"
@@ -30,6 +31,7 @@ rand = "0.9"
 rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha1 = "0.10"
 sha2 = "0.10"
 serial_test = "3"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "migrate", "macros"] }

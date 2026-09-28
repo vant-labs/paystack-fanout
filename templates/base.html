@@ -21,11 +21,13 @@
         <a class="nav-link" href="/dashboard/unrouted"><span>Unrouted</span></a>
         <a class="nav-link" href="/dashboard/audit"><span>Audit log</span></a>
         <a class="nav-link" href="/dashboard/config"><span>Sources &amp; routes</span></a>
+        <a class="nav-link" href="/dashboard/users"><span>Users</span></a>
+        <a class="nav-link" href="/dashboard/settings"><span>Settings</span></a>
       </nav>
       <div class="sidebar-bottom">
         <button class="theme-button" type="button" data-theme-toggle aria-label="Toggle color theme"><span data-theme-icon>☼</span><span>Theme</span></button>
         <div class="user-card"><div class="avatar">{{ user.initial }}</div><div class="user-meta"><strong>{{ user.email }}</strong><span>{{ user.role }}</span></div></div>
-        <form method="post" action="/logout"><button class="signout" type="submit">Sign out</button></form>
+        <form method="post" action="/logout"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="signout" type="submit">Sign out</button></form>
       </div>
     </aside>
     <main class="main-content">

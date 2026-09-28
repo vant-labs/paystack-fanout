@@ -5,8 +5,11 @@ use argon2::{
     password_hash::{SaltString, rand_core::OsRng},
 };
 use axum::http::{HeaderMap, HeaderValue, header};
+use data_encoding::BASE32_NOPAD;
+use hmac::{Hmac, Mac};
 use rand::random;
 use serde::Serialize;
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
@@ -125,6 +128,28 @@ pub fn clear_session_cookie(secure: bool) -> HeaderValue {
         "{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{secure_flag}"
     ))
     .expect("session cookie is valid")
+}
+
+pub fn verify_totp(secret: &str, code: &str, timestamp: u64) -> bool {
+    if code.len() != 6 || !code.bytes().all(|value| value.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(key) = BASE32_NOPAD.decode(secret.as_bytes()) else {
+        return false;
+    };
+    let counter = (timestamp / 30).to_be_bytes();
+    let Ok(mut mac) = Hmac::<Sha1>::new_from_slice(&key) else {
+        return false;
+    };
+    mac.update(&counter);
+    let digest = mac.finalize().into_bytes();
+    let offset = usize::from(digest[19] & 0x0f);
+    let value = (u32::from(digest[offset] & 0x7f) << 24)
+        | (u32::from(digest[offset + 1]) << 16)
+        | (u32::from(digest[offset + 2]) << 8)
+        | u32::from(digest[offset + 3]);
+    let expected = format!("{:06}", value % 1_000_000);
+    expected.as_bytes().ct_eq(code.as_bytes()).into()
 }
 
 #[cfg(test)]

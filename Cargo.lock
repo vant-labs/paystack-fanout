@@ -533,6 +533,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-encoding"
+version = "2.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
+
+[[package]]
 name = "deadpool"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1505,6 +1511,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "data-encoding",
  "futures-util",
  "hex",
  "hmac",
@@ -1518,6 +1525,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "sha1",
  "sha2",
  "sqlx",
  "subtle",
