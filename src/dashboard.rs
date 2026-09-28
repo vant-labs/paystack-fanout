@@ -833,8 +833,8 @@ async fn users(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
     let Some(user) = require_user(&state, &headers).await else {
         return Redirect::to("/login").into_response();
     };
-    if !user.role.can_manage() {
-        return (StatusCode::FORBIDDEN, "Owner access is required").into_response();
+    if !user.role.can_manage_users() {
+        return (StatusCode::FORBIDDEN, "Admin or owner access is required").into_response();
     }
     match state.db.list_users().await {
         Ok(users) => render(UsersPage {
@@ -854,8 +854,8 @@ async fn create_user(
     let Some(user) = require_user(&state, &headers).await else {
         return Redirect::to("/login").into_response();
     };
-    if !user.role.can_manage() || !csrf_matches(&user.csrf_token, Some(&form.csrf)) {
-        return (StatusCode::FORBIDDEN, "Owner access is required").into_response();
+    if !user.role.can_manage_users() || !csrf_matches(&user.csrf_token, Some(&form.csrf)) {
+        return (StatusCode::FORBIDDEN, "Admin or owner access is required").into_response();
     }
     let Some(role) = Role::parse(&form.role) else {
         return (StatusCode::BAD_REQUEST, "Invalid role").into_response();
@@ -906,13 +906,13 @@ async fn disable_user(
     let Some(user) = require_user(&state, &headers).await else {
         return Redirect::to("/login").into_response();
     };
-    if !user.role.can_manage() || !csrf_matches(&user.csrf_token, Some(&form.csrf)) {
-        return (StatusCode::FORBIDDEN, "Owner access is required").into_response();
+    if !user.role.can_manage_users() || !csrf_matches(&user.csrf_token, Some(&form.csrf)) {
+        return (StatusCode::FORBIDDEN, "Admin or owner access is required").into_response();
     }
     if id == user.id {
         return (
             StatusCode::BAD_REQUEST,
-            "The current owner cannot be disabled",
+            "The current account cannot be disabled",
         )
             .into_response();
     }
@@ -945,8 +945,8 @@ async fn reset_2fa(
     let Some(user) = require_user(&state, &headers).await else {
         return Redirect::to("/login").into_response();
     };
-    if !user.role.can_manage() || !csrf_matches(&user.csrf_token, Some(&form.csrf)) {
-        return (StatusCode::FORBIDDEN, "Owner access is required").into_response();
+    if !user.role.can_manage_users() || !csrf_matches(&user.csrf_token, Some(&form.csrf)) {
+        return (StatusCode::FORBIDDEN, "Admin or owner access is required").into_response();
     }
     match state.db.reset_totp(id).await {
         Ok(true) => {
