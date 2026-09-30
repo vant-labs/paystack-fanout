@@ -21,7 +21,7 @@ use paystack_fanout::{
 };
 use serde_json::json;
 use serial_test::serial;
-use sha2::Sha512;
+use sha2::{Sha256, Sha512};
 use tower::ServiceExt;
 use wiremock::{
     Mock, MockServer, Request as WireRequest, Respond, ResponseTemplate,
@@ -89,6 +89,16 @@ async fn post_source(
     body: Vec<u8>,
     signature: Option<String>,
 ) -> StatusCode {
+    post_source_with_header(state, source, body, "x-paystack-signature", signature).await
+}
+
+async fn post_source_with_header(
+    state: Arc<AppState>,
+    source: &str,
+    body: Vec<u8>,
+    header_name: &str,
+    signature: Option<String>,
+) -> StatusCode {
     let app = build_router(state).layer(Extension(ConnectInfo(std::net::SocketAddr::from((
         [127, 0, 0, 1],
         1234,
@@ -96,12 +106,22 @@ async fn post_source(
     let mut request =
         Request::post(format!("/in/{source}")).header("content-type", "application/json");
     if let Some(signature) = signature {
-        request = request.header("x-paystack-signature", signature);
+        request = request.header(header_name, signature);
     }
     app.oneshot(request.body(Body::from(body)).unwrap())
         .await
         .unwrap()
         .status()
+}
+
+fn app_store_connect_signature_with_secret(secret: &str, body: &[u8]) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(body);
+    format!("hmacsha256={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+fn app_store_connect_signature(body: &[u8]) -> String {
+    app_store_connect_signature_with_secret(&std::env::var("PAYSTACK_SECRET_KEY").unwrap(), body)
 }
 
 #[tokio::test]
@@ -133,6 +153,80 @@ async fn ingest_rejects_bad_and_missing_signature_and_keeps_paystack_dedupe_key(
             .await
             .unwrap();
     assert_eq!(stored, paystack_fanout::security::dedupe_key(&body));
+}
+
+#[tokio::test]
+#[serial]
+async fn app_store_connect_rejects_tampered_and_wrong_secret_requests_with_401() {
+    if !can_run() {
+        return;
+    }
+    let db = Database::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    db.migrate().await.unwrap();
+    sqlx::query("TRUNCATE delivery_attempts, deliveries, events CASCADE")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let config = Config {
+        source: HashMap::from([(
+            "apple_connect_main".to_owned(),
+            SourceConfig {
+                provider: "apple_connect_webhooks".into(),
+                secret_env: "PAYSTACK_SECRET_KEY".into(),
+                allowed_ips: vec![],
+            },
+        )]),
+        route: vec![],
+        fallback: FallbackConfig {
+            mode: "unrouted".into(),
+        },
+        alerts: None,
+        retention_days: 90,
+    };
+    let state = Arc::new(AppState::new(config, db.clone()).unwrap());
+    let body = serde_json::to_vec(&json!({
+        "data": {
+            "type": "buildUploadStateUpdated",
+            "id": "build-event-1",
+            "attributes": {"appId": "123456789"}
+        }
+    }))
+    .unwrap();
+    assert_eq!(
+        post_source_with_header(
+            state.clone(),
+            "apple_connect_main",
+            body.clone(),
+            "x-apple-signature",
+            Some(app_store_connect_signature(&body)),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_source_with_header(
+            state.clone(),
+            "apple_connect_main",
+            br#"{"data":{"type":"tampered"}}"#.to_vec(),
+            "x-apple-signature",
+            Some(app_store_connect_signature(&body)),
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        post_source_with_header(
+            state,
+            "apple_connect_main",
+            body.clone(),
+            "x-apple-signature",
+            Some(app_store_connect_signature_with_secret("wrong", &body)),
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 #[tokio::test]

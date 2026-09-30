@@ -1,0 +1,12 @@
+{
+  "data": {
+    "type": "appStoreVersionAppVersionStateUpdated",
+    "id": "version-event-1",
+    "attributes": {
+      "appId": "123456789",
+      "newValue": "READY_FOR_REVIEW",
+      "oldValue": "PREPARE_FOR_SUBMISSION",
+      "timestamp": "2026-09-30T12:00:00Z"
+    }
+  }
+}
