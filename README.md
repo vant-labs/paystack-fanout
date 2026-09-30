@@ -13,7 +13,9 @@ multi-customer service.
 ```mermaid
 flowchart LR
     P[Paystack] -->|raw POST| I["POST /in/{source}"]
-    AS[Reserved store adapters] -.-> I
+    AS[Apple Server Notifications V2] --> I
+    GP[Reserved Google RTDN adapter] -.-> I
+    AC[Reserved Apple Connect adapter] -.-> I
     I --> V[Provider auth + IP check]
     V --> D[(Postgres events)]
     D --> Q[(Postgres deliveries)]
@@ -31,8 +33,8 @@ transactional persistence, and acknowledgement. Forwarding never runs inline.
 The destination receives the original body and authentication headers,
 unchanged, plus `X-Fanout-Event-Id` and `X-Fanout-Attempt`.
 
-The only implemented source provider is `paystack`. The source names
-`apple_server_notifications`, `google_play_rtdn`, and
+The implemented source providers are `paystack` and
+`apple_server_notifications`. The source names `google_play_rtdn` and
 `apple_connect_webhooks` are reserved for later provider work; they reject
 requests until their authentication adapters are implemented.
 
@@ -96,6 +98,28 @@ allows the first address in `X-Forwarded-For` to be checked; otherwise the TCP
 peer address is used. The request body limit is 256 KiB. `RETENTION_DAYS`
 defaults to 90; delivery records are kept for 30 days and delivered event
 records follow the configured retention.
+
+### Apple Server Notifications V2
+
+Configure an App Store Server Notifications V2 source with provider
+`apple_server_notifications`. It does not use a shared secret; the
+`secret_env` field remains for configuration compatibility. The adapter
+authenticates the outer `signedPayload` JWS, validates its `x5c` certificate
+chain to the bundled Apple Root CA - G3 certificate, and then routes on the
+signed payload's `data.bundleId` and `data.environment` values. The original
+JSON body, including the inner signed transaction and renewal information, is
+forwarded unchanged.
+
+Use separate source names and routes for Production and Sandbox URLs in App
+Store Connect, for example `/in/apple_production` and `/in/apple_sandbox`.
+Set route `app_identifier` to the app's bundle ID and `environment` to
+`production` or `sandbox`. The bundled certificate was downloaded from
+[Apple PKI](https://www.apple.com/certificateauthority/); the signed payload
+format and `x5c` chain are described in Apple's
+[signedPayload](https://developer.apple.com/documentation/appstoreserverapi/signedpayload)
+and [JWSDecodedHeader](https://developer.apple.com/documentation/appstoreserverapi/jwsdecodedheader).
+The bundled certificate is stored at `src/certs/apple/AppleRootCA-G3.cer` for
+container builds.
 
 An alert destination may be enabled with:
 

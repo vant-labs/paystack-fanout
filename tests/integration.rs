@@ -147,10 +147,10 @@ async fn ingest_rejects_unimplemented_provider() {
     db.migrate().await.unwrap();
     let config = Config {
         source: HashMap::from([(
-            "apple_main".to_owned(),
+            "google_main".to_owned(),
             SourceConfig {
-                provider: "apple_server_notifications".into(),
-                secret_env: "APPLE_SECRET".into(),
+                provider: "google_play_rtdn".into(),
+                secret_env: "GOOGLE_SECRET".into(),
                 allowed_ips: vec![],
             },
         )]),
@@ -163,7 +163,7 @@ async fn ingest_rejects_unimplemented_provider() {
     };
     let state = Arc::new(AppState::new(config, db).unwrap());
     assert_eq!(
-        post_source(state, "apple_main", br#"{}"#.to_vec(), None).await,
+        post_source(state, "google_main", br#"{}"#.to_vec(), None).await,
         StatusCode::UNAUTHORIZED
     );
 }
