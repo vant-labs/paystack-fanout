@@ -21,7 +21,7 @@ use crate::{
         Role, SessionUser, clear_session_cookie, csrf_matches, hash_password, random_token,
         session_cookie, session_token, verify_password, verify_totp,
     },
-    config::RouteMatcher,
+    config::{ExtendedRouteMatcher, RouteMatcher},
     db::{AuditEntry, EventDetail, EventSummary, HealthPoint, HealthWindow, OverviewStats},
     db::{RouteView, SourceView, UserView},
 };
@@ -170,6 +170,8 @@ struct RouteEditor {
     metadata_app: String,
     plan_code_prefix: String,
     reference_prefix: String,
+    app_identifier: String,
+    environment: String,
     timeout_seconds: i32,
     max_attempts: i32,
     enabled: bool,
@@ -184,6 +186,8 @@ impl Default for RouteEditor {
             metadata_app: String::new(),
             plan_code_prefix: String::new(),
             reference_prefix: String::new(),
+            app_identifier: String::new(),
+            environment: String::new(),
             timeout_seconds: 10,
             max_attempts: 10,
             enabled: true,
@@ -232,6 +236,8 @@ struct RouteForm {
     metadata_app: Option<String>,
     plan_code_prefix: Option<String>,
     reference_prefix: Option<String>,
+    app_identifier: Option<String>,
+    environment: Option<String>,
     timeout_seconds: i32,
     max_attempts: i32,
     enabled: Option<String>,
@@ -620,7 +626,8 @@ async fn event_detail(
         .ok()
         .and_then(|value| serde_json::to_string_pretty(&value).ok())
         .unwrap_or_else(|| detail.raw_body.clone());
-    let headers_json = masked_headers(&detail.headers);
+    let headers_json =
+        serde_json::to_string_pretty(&detail.headers).unwrap_or_else(|_| "{}".to_owned());
     render(EventDetailPage {
         user,
         csrf: current_csrf(&state, &headers).await.unwrap_or_default(),
@@ -1094,6 +1101,8 @@ async fn configuration(
             metadata_app: route.matcher.metadata_app.clone().unwrap_or_default(),
             plan_code_prefix: route.matcher.plan_code_prefix.clone().unwrap_or_default(),
             reference_prefix: route.matcher.reference_prefix.clone().unwrap_or_default(),
+            app_identifier: route.app_identifier.clone().unwrap_or_default(),
+            environment: route.environment.clone().unwrap_or_default(),
             timeout_seconds: route.timeout_seconds,
             max_attempts: route.max_attempts,
             enabled: route.enabled,
@@ -1177,11 +1186,24 @@ async fn save_route(
         )
             .into_response();
     }
-    let matcher = RouteMatcher {
+    let environment = clean_option(form.environment);
+    if !environment
+        .as_deref()
+        .is_none_or(|value| matches!(value, "production" | "sandbox"))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Environment must be production or sandbox",
+        )
+            .into_response();
+    }
+    let matcher = RouteMatcher::from_extended(ExtendedRouteMatcher {
         metadata_app: clean_option(form.metadata_app),
         plan_code_prefix: clean_option(form.plan_code_prefix),
         reference_prefix: clean_option(form.reference_prefix),
-    };
+        app_identifier: clean_option(form.app_identifier),
+        environment,
+    });
     match state
         .db
         .save_route(
@@ -1228,10 +1250,10 @@ async fn save_source(
         return (StatusCode::FORBIDDEN, "Owner access is required").into_response();
     }
     let name = form.name.trim();
-    if name.is_empty() || form.provider.trim() != "paystack" {
+    if name.is_empty() || !crate::provider::supported_providers().contains(&form.provider.trim()) {
         return (
             StatusCode::BAD_REQUEST,
-            "A source name and the paystack provider are required",
+            "A source name and a supported provider are required",
         )
             .into_response();
     }
@@ -1404,16 +1426,6 @@ fn login_failed(state: &AppState, key: &str) {
         .entry(key.to_owned())
         .or_insert((0, std::time::Instant::now()));
     entry.0 = entry.0.saturating_add(1);
-}
-
-fn masked_headers(headers: &Value) -> String {
-    let mut value = headers.clone();
-    if let Some(signature) = value.get_mut("x-paystack-signature")
-        && let Some(text) = signature.as_str()
-    {
-        *signature = Value::String(format!("{}…", text.chars().take(8).collect::<String>()));
-    }
-    serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_owned())
 }
 
 fn render<T: Template>(template: T) -> Response {

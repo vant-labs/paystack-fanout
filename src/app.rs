@@ -22,12 +22,12 @@ use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
 use crate::{
-    config::{Config, RouteConfig as ConfigRoute},
-    db::{Database, DatabaseRoute, InsertResult},
+    config::{Config, ExtendedRouteMatcher, RouteConfig as ConfigRoute},
+    db::{Database, DatabaseRoute, DatabaseRouteRecord, DatabaseRouteResponse, InsertResult},
     metrics::Metrics,
-    provider::{PaystackProvider, Provider},
-    routing::{MatchSource, database_route, decide, reference},
-    security::{bearer_matches, dedupe_key},
+    provider::{Provider, provider_for},
+    routing::{MatchSource, database_route_records, decide_with_fields, reference},
+    security::bearer_matches,
 };
 
 #[derive(Clone)]
@@ -49,7 +49,7 @@ pub struct AppState {
     alert_url_override: Option<String>,
 }
 
-pub type RouteCache = Option<(Instant, Vec<DatabaseRoute>)>;
+pub type RouteCache = Option<(Instant, Vec<DatabaseRouteRecord>)>;
 
 impl AppState {
     pub fn new(config: Config, db: Database) -> anyhow::Result<Self> {
@@ -134,17 +134,17 @@ impl AppState {
         *self.route_cache.write().await = None;
     }
 
-    pub async fn cached_routes(&self) -> Vec<DatabaseRoute> {
+    pub async fn cached_route_records(&self) -> Vec<DatabaseRouteRecord> {
         if let Some((loaded_at, routes)) = self.route_cache.read().await.as_ref()
             && loaded_at.elapsed() < Duration::from_secs(30)
         {
             return routes.clone();
         }
-        match self.db.list_database_routes().await {
+        match self.db.list_database_route_records().await {
             Ok(routes) => {
                 let routes = routes
                     .into_iter()
-                    .filter(|route| route.enabled)
+                    .filter(|route| route.route.enabled)
                     .collect::<Vec<_>>();
                 *self.route_cache.write().await = Some((Instant::now(), routes.clone()));
                 routes
@@ -159,6 +159,14 @@ impl AppState {
                     .unwrap_or_default()
             }
         }
+    }
+
+    pub async fn cached_routes(&self) -> Vec<DatabaseRoute> {
+        self.cached_route_records()
+            .await
+            .into_iter()
+            .map(|record| record.route)
+            .collect()
     }
 }
 
@@ -223,6 +231,14 @@ pub(crate) async fn ingest(
     let Some(source_config) = active_config.source.get(&source) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let Some(provider) = provider_for(&source_config.provider) else {
+        tracing::error!(source = %source, provider = %source_config.provider, "unsupported source provider");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if !provider.implemented() {
+        tracing::warn!(source = %source, provider = provider.name(), "webhook provider is not implemented");
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     if !allowed_ip(
         source_config.allowed_ips.as_slice(),
         state.trust_proxy,
@@ -232,9 +248,7 @@ pub(crate) async fn ingest(
         tracing::warn!(source = %source, "webhook rejected by IP allowlist");
         return StatusCode::FORBIDDEN.into_response();
     }
-    let signature = headers
-        .get("x-paystack-signature")
-        .and_then(|value| value.to_str().ok());
+    let signature = provider.authenticated_header(&headers);
     let secret = match active_secrets
         .get(&source)
         .cloned()
@@ -246,7 +260,7 @@ pub(crate) async fn ingest(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    if !PaystackProvider.verify_signature(secret.as_bytes(), &body, signature) {
+    if !provider.authenticate(secret.as_bytes(), &headers, &body) {
         state
             .metrics
             .verified_failed
@@ -267,32 +281,24 @@ pub(crate) async fn ingest(
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
-    let event_type = PaystackProvider.event_type(&payload);
-    let database_routes = state.cached_routes().await;
-    let database_match = database_route(&database_routes, &payload);
-    let database_route_id = database_match.map(|route| route.id);
+    let event_type = provider.event_type(&payload);
+    let event_id = provider.event_id(&payload, &body);
+    let routing_fields = provider.routing_fields(&payload);
+    let database_routes = state.cached_route_records().await;
+    let database_match = database_route_records(&database_routes, &routing_fields);
+    let database_route_id = database_match.map(|route| route.route.id);
     let decision = if let Some(route) = database_match {
         crate::routing::RouteDecision {
-            source: if route.metadata_app.as_deref().is_some_and(|value| {
-                crate::routing::metadata_app(payload.get("data").unwrap_or(&payload)).as_deref()
-                    == Some(value)
-            }) {
-                MatchSource::MetadataApp
-            } else {
-                MatchSource::Reference
-            },
+            source: crate::routing::match_source(&route.matcher, &routing_fields)
+                .unwrap_or(MatchSource::Fallback),
             route: Some(ConfigRoute {
-                name: route.name.clone(),
-                destination_url: route.target_url.clone(),
-                matcher: crate::config::RouteMatcher {
-                    metadata_app: route.metadata_app.clone(),
-                    reference_prefix: route.ref_prefix.clone(),
-                    plan_code_prefix: None,
-                },
+                name: route.route.name.clone(),
+                destination_url: route.route.target_url.clone(),
+                matcher: crate::config::RouteMatcher::from_extended(route.matcher.clone()),
             }),
         }
     } else {
-        decide(&active_config, &payload)
+        decide_with_fields(&active_config, &payload, &routing_fields)
     };
     let matched_route = decision.route.as_ref().map(|route| route.name.as_str());
     if matches!(decision.source, MatchSource::Fallback) && matched_route.is_some() {
@@ -310,15 +316,11 @@ pub(crate) async fn ingest(
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json");
-    let stored_headers = json!({
-        "content-type": content_type,
-        "x-paystack-signature": signature.unwrap_or_default(),
-        "user-agent": headers.get(header::USER_AGENT).and_then(|value| value.to_str().ok()),
-    });
-    let dedupe = dedupe_key(&body);
+    let stored_headers = headers_to_json(&headers, provider);
+    let dedupe = provider.dedupe_key(&payload, &body);
     let inserted = match state
         .db
-        .insert_event(
+        .insert_event_with_provider_event_id(
             &source,
             event_type,
             &body,
@@ -326,8 +328,11 @@ pub(crate) async fn ingest(
             signature.unwrap_or_default(),
             &stored_headers,
             &dedupe,
+            &event_id,
             matched_route,
             Some(match decision.source {
+                MatchSource::AppIdentifier => "app_identifier",
+                MatchSource::Environment => "environment",
                 MatchSource::MetadataApp => "metadata.app",
                 MatchSource::PlanCode => "plan_code",
                 MatchSource::Reference => "reference",
@@ -375,9 +380,17 @@ pub(crate) async fn ingest(
                     .unrouted
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let state_clone = state.clone();
+                let provider_label = if provider.name() == "paystack" {
+                    "Paystack"
+                } else {
+                    provider.name()
+                };
                 tokio::spawn(async move {
                     state_clone
-                        .alert(format!("Paystack event {event_id} was stored as unrouted"))
+                        .alert(format!(
+                            "{} event {event_id} was stored as unrouted",
+                            provider_label
+                        ))
                         .await;
                 });
             }
@@ -406,6 +419,28 @@ fn allowed_ip(
     }
     .or(remote);
     ip.is_some_and(|ip| allowed.contains(&ip))
+}
+
+fn headers_to_json(headers: &HeaderMap, provider: &dyn Provider) -> Value {
+    let mut object = serde_json::Map::new();
+    let mut names = vec![header::CONTENT_TYPE.as_str()];
+    names.extend(provider.auth_header_names());
+    for name in names {
+        let values = headers
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok().map(str::to_owned))
+            .collect::<Vec<_>>();
+        if values.len() == 1 {
+            object.insert(name.to_owned(), Value::String(values[0].clone()));
+        } else if !values.is_empty() {
+            object.insert(
+                name.to_owned(),
+                Value::Array(values.into_iter().map(Value::String).collect()),
+            );
+        }
+    }
+    Value::Object(object)
 }
 
 #[utoipa::path(
@@ -647,7 +682,14 @@ pub(crate) struct RouteWriteBody {
     pub target_url: Option<String>,
     pub ref_prefix: Option<String>,
     pub metadata_app: Option<String>,
+    pub plan_code_prefix: Option<String>,
+    pub app_identifier: Option<String>,
+    pub environment: Option<String>,
     pub enabled: Option<bool>,
+}
+
+fn valid_environment(environment: Option<&str>) -> bool {
+    environment.is_none_or(|value| matches!(value, "production" | "sandbox"))
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -704,7 +746,7 @@ async fn api_authorized(state: &AppState, headers: &HeaderMap, write: bool) -> b
 #[utoipa::path(
     get,
     path = "/admin/routes",
-    responses((status = 200, description = "Enabled routes", body = [crate::db::DatabaseRoute])),
+    responses((status = 200, description = "Enabled routes", body = [crate::db::DatabaseRouteResponse])),
     security(("admin_bearer" = [])),
     tag = "Admin API"
 )]
@@ -715,8 +757,14 @@ pub(crate) async fn list_admin_routes(
     if !api_authorized(&state, &headers, false).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    match state.db.list_database_routes().await {
-        Ok(routes) => Json(routes).into_response(),
+    match state.db.list_database_route_records().await {
+        Ok(routes) => Json(
+            routes
+                .into_iter()
+                .map(DatabaseRouteResponse::from)
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
         Err(error) => {
             tracing::error!(error = %error, "listing routes failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -728,7 +776,7 @@ pub(crate) async fn list_admin_routes(
     post,
     path = "/admin/routes",
     request_body = RouteWriteBody,
-    responses((status = 201, description = "Route created", body = crate::db::DatabaseRoute)),
+    responses((status = 201, description = "Route created", body = crate::db::DatabaseRouteResponse)),
     security(("admin_bearer" = [])),
     tag = "Admin API"
 )]
@@ -745,7 +793,12 @@ pub(crate) async fn create_admin_route(
     };
     if name.trim().is_empty()
         || !valid_https_target(target_url)
-        || (body.ref_prefix.is_none() && body.metadata_app.is_none())
+        || !valid_environment(body.environment.as_deref())
+        || (body.ref_prefix.is_none()
+            && body.metadata_app.is_none()
+            && body.plan_code_prefix.is_none()
+            && body.app_identifier.is_none()
+            && body.environment.is_none())
     {
         return (
             StatusCode::BAD_REQUEST,
@@ -755,18 +808,34 @@ pub(crate) async fn create_admin_route(
     }
     match state
         .db
-        .create_database_route(
+        .create_database_route_with_matcher(
             name,
             target_url,
-            body.ref_prefix.as_deref(),
-            body.metadata_app.as_deref(),
+            &ExtendedRouteMatcher {
+                metadata_app: body.metadata_app.clone(),
+                plan_code_prefix: body.plan_code_prefix.clone(),
+                reference_prefix: body.ref_prefix.clone(),
+                app_identifier: body.app_identifier.clone(),
+                environment: body.environment.clone(),
+            },
             body.enabled.unwrap_or(true),
         )
         .await
     {
         Ok(route) => {
             state.clear_route_cache().await;
-            (StatusCode::CREATED, Json(route)).into_response()
+            match state.db.find_database_route_record(&route.name).await {
+                Ok(Some(record)) => (
+                    StatusCode::CREATED,
+                    Json(DatabaseRouteResponse::from(record)),
+                )
+                    .into_response(),
+                Ok(None) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                Err(error) => {
+                    tracing::error!(error = %error, "loading created route failed");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }
         }
         Err(error) => {
             tracing::error!(error = %error, "creating route failed");
@@ -780,7 +849,7 @@ pub(crate) async fn create_admin_route(
     path = "/admin/routes/{name}",
     params(("name" = String, Path, description = "Route name")),
     request_body = RouteWriteBody,
-    responses((status = 200, description = "Route updated", body = crate::db::DatabaseRoute)),
+    responses((status = 200, description = "Route updated", body = crate::db::DatabaseRouteResponse)),
     security(("admin_bearer" = [])),
     tag = "Admin API"
 )]
@@ -800,20 +869,37 @@ pub(crate) async fn update_admin_route(
     {
         return (StatusCode::BAD_REQUEST, "target_url must be https").into_response();
     }
+    if !valid_environment(body.environment.as_deref()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "environment must be production or sandbox",
+        )
+            .into_response();
+    }
     match state
         .db
-        .update_database_route(
+        .update_database_route_with_matcher(
             &name,
             body.target_url.as_deref(),
             body.ref_prefix.as_deref().map(Some),
             body.metadata_app.as_deref().map(Some),
+            body.plan_code_prefix.as_deref().map(Some),
+            body.app_identifier.as_deref().map(Some),
+            body.environment.as_deref().map(Some),
             body.enabled,
         )
         .await
     {
         Ok(Some(route)) => {
             state.clear_route_cache().await;
-            Json(route).into_response()
+            match state.db.find_database_route_record(&route.name).await {
+                Ok(Some(record)) => Json(DatabaseRouteResponse::from(record)).into_response(),
+                Ok(None) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                Err(error) => {
+                    tracing::error!(error = %error, "loading updated route failed");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),

@@ -2,11 +2,14 @@ use serde_json::Value;
 
 use crate::{
     config::{Config, RouteConfig},
-    db::DatabaseRoute,
+    db::{DatabaseRoute, DatabaseRouteRecord},
+    provider::RoutingFields,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatchSource {
+    AppIdentifier,
+    Environment,
     MetadataApp,
     PlanCode,
     Reference,
@@ -23,20 +26,119 @@ pub fn database_route<'a>(
     routes: &'a [DatabaseRoute],
     payload: &Value,
 ) -> Option<&'a DatabaseRoute> {
-    let data = payload.get("data").unwrap_or(payload);
-    let app = metadata_app(data);
-    let reference = reference(data);
+    let fields = routing_fields_from_payload(payload);
     routes.iter().find(|route| {
-        route
-            .metadata_app
-            .as_deref()
-            .is_some_and(|value| app.as_deref() == Some(value))
-            || route.ref_prefix.as_deref().is_some_and(|prefix| {
-                reference
-                    .as_deref()
-                    .is_some_and(|value| value.starts_with(prefix))
-            })
+        let matcher = crate::config::ExtendedRouteMatcher {
+            metadata_app: route.metadata_app.clone(),
+            plan_code_prefix: None,
+            reference_prefix: route.ref_prefix.clone(),
+            app_identifier: None,
+            environment: None,
+        };
+        route_matches(&matcher, &fields)
     })
+}
+
+pub fn database_route_records<'a>(
+    routes: &'a [DatabaseRouteRecord],
+    fields: &RoutingFields,
+) -> Option<&'a DatabaseRouteRecord> {
+    for preferred_source in [
+        MatchSource::MetadataApp,
+        MatchSource::PlanCode,
+        MatchSource::Reference,
+        MatchSource::AppIdentifier,
+        MatchSource::Environment,
+    ] {
+        if let Some(route) = routes
+            .iter()
+            .find(|route| match_source(&route.matcher, fields).as_ref() == Some(&preferred_source))
+        {
+            return Some(route);
+        }
+    }
+    None
+}
+
+pub fn route_matches(
+    matcher: &crate::config::ExtendedRouteMatcher,
+    fields: &RoutingFields,
+) -> bool {
+    let identity_matches = matcher
+        .app_identifier
+        .as_deref()
+        .is_none_or(|value| fields.app_identifier.as_deref() == Some(value))
+        && matcher
+            .environment
+            .as_deref()
+            .is_none_or(|value| fields.environment.as_deref() == Some(value));
+    let legacy_rules_configured = matcher.metadata_app.is_some()
+        || matcher.plan_code_prefix.is_some()
+        || matcher.reference_prefix.is_some();
+    let legacy_matches = matcher
+        .metadata_app
+        .as_deref()
+        .is_some_and(|value| fields.metadata_app.as_deref() == Some(value))
+        || matcher.plan_code_prefix.as_deref().is_some_and(|prefix| {
+            fields
+                .plan_code
+                .as_deref()
+                .is_some_and(|value| value.starts_with(prefix))
+        })
+        || matcher.reference_prefix.as_deref().is_some_and(|prefix| {
+            fields
+                .reference
+                .as_deref()
+                .is_some_and(|value| value.starts_with(prefix))
+        });
+    identity_matches && (!legacy_rules_configured || legacy_matches)
+}
+
+pub fn match_source(
+    matcher: &crate::config::ExtendedRouteMatcher,
+    fields: &RoutingFields,
+) -> Option<MatchSource> {
+    if !route_matches(matcher, fields) {
+        return None;
+    }
+    if matcher
+        .metadata_app
+        .as_deref()
+        .is_some_and(|value| fields.metadata_app.as_deref() == Some(value))
+    {
+        return Some(MatchSource::MetadataApp);
+    }
+    if matcher.plan_code_prefix.as_deref().is_some_and(|prefix| {
+        fields
+            .plan_code
+            .as_deref()
+            .is_some_and(|value| value.starts_with(prefix))
+    }) {
+        return Some(MatchSource::PlanCode);
+    }
+    if matcher.reference_prefix.as_deref().is_some_and(|prefix| {
+        fields
+            .reference
+            .as_deref()
+            .is_some_and(|value| value.starts_with(prefix))
+    }) {
+        return Some(MatchSource::Reference);
+    }
+    if matcher
+        .app_identifier
+        .as_deref()
+        .is_some_and(|value| fields.app_identifier.as_deref() == Some(value))
+    {
+        return Some(MatchSource::AppIdentifier);
+    }
+    if matcher
+        .environment
+        .as_deref()
+        .is_some_and(|value| fields.environment.as_deref() == Some(value))
+    {
+        return Some(MatchSource::Environment);
+    }
+    None
 }
 
 pub fn reference(data: &Value) -> Option<String> {
@@ -52,68 +154,29 @@ pub fn reference(data: &Value) -> Option<String> {
 /// <https://paystack.com/docs/api/charge/>
 /// <https://paystack.com/docs/payments/subscriptions/>
 pub fn decide(config: &Config, payload: &Value) -> RouteDecision {
-    let data = payload.get("data").unwrap_or(payload);
-    let metadata_app = metadata_app(data);
-    if let Some(route) = config.route.iter().find(|route| {
-        route
-            .matcher
-            .metadata_app
-            .as_deref()
-            .is_some_and(|needle| metadata_app.as_deref() == Some(needle))
-    }) {
-        return RouteDecision {
-            route: Some(route.clone()),
-            source: MatchSource::MetadataApp,
-        };
-    }
+    decide_with_fields(config, payload, &routing_fields_from_payload(payload))
+}
 
-    let plan_code = data
-        .get("plan")
-        .and_then(extract_plan_code)
-        .or_else(|| {
-            data.pointer("/subscription/plan/plan_code")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .or_else(|| {
-            data.get("subscription")
-                .and_then(Value::as_object)
-                .and_then(|s| s.get("plan"))
-                .and_then(extract_plan_code)
-        });
-    if let Some(route) = config.route.iter().find(|route| {
-        route
-            .matcher
-            .plan_code_prefix
-            .as_deref()
-            .is_some_and(|prefix| {
-                plan_code
-                    .as_deref()
-                    .is_some_and(|value| value.starts_with(prefix))
-            })
-    }) {
-        return RouteDecision {
-            route: Some(route.clone()),
-            source: MatchSource::PlanCode,
-        };
-    }
-
-    let reference = data
-        .get("reference")
-        .and_then(Value::as_str)
-        .or_else(|| data.get("subscription_code").and_then(Value::as_str))
-        .or_else(|| data.get("customer_code").and_then(Value::as_str));
-    if let Some(route) = config.route.iter().find(|route| {
-        route
-            .matcher
-            .reference_prefix
-            .as_deref()
-            .is_some_and(|prefix| reference.is_some_and(|value| value.starts_with(prefix)))
-    }) {
-        return RouteDecision {
-            route: Some(route.clone()),
-            source: MatchSource::Reference,
-        };
+pub fn decide_with_fields(
+    config: &Config,
+    _payload: &Value,
+    fields: &RoutingFields,
+) -> RouteDecision {
+    for preferred_source in [
+        MatchSource::MetadataApp,
+        MatchSource::PlanCode,
+        MatchSource::Reference,
+        MatchSource::AppIdentifier,
+        MatchSource::Environment,
+    ] {
+        if let Some(route) = config.route.iter().find(|route| {
+            match_source(&route.matcher.extended(), fields).as_ref() == Some(&preferred_source)
+        }) {
+            return RouteDecision {
+                route: Some(route.clone()),
+                source: preferred_source,
+            };
+        }
     }
 
     let route = config
@@ -125,6 +188,46 @@ pub fn decide(config: &Config, payload: &Value) -> RouteDecision {
     RouteDecision {
         route,
         source: MatchSource::Fallback,
+    }
+}
+
+pub fn routing_fields_from_payload(payload: &Value) -> RoutingFields {
+    let data = payload.get("data").unwrap_or(payload);
+    RoutingFields {
+        metadata_app: metadata_app(data),
+        plan_code: data
+            .get("plan")
+            .and_then(extract_plan_code)
+            .or_else(|| {
+                data.pointer("/subscription/plan/plan_code")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                data.get("subscription")
+                    .and_then(Value::as_object)
+                    .and_then(|subscription| subscription.get("plan"))
+                    .and_then(extract_plan_code)
+            }),
+        reference: reference(data),
+        app_identifier: ["appIdentifier", "bundleId", "packageName"]
+            .iter()
+            .find_map(|key| data.get(*key).and_then(Value::as_str).map(str::to_owned))
+            .or_else(|| {
+                payload
+                    .get("packageName")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            }),
+        environment: ["environment", "env"]
+            .iter()
+            .find_map(|key| data.get(*key).and_then(Value::as_str).map(str::to_owned))
+            .or_else(|| {
+                payload
+                    .get("environment")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            }),
     }
 }
 
@@ -163,7 +266,7 @@ fn extract_plan_code(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{FallbackConfig, RouteMatcher, SourceConfig};
+    use crate::config::{ExtendedRouteMatcher, FallbackConfig, RouteMatcher, SourceConfig};
     use crate::db::DatabaseRoute;
     use std::{collections::HashMap, net::IpAddr};
 
@@ -234,6 +337,45 @@ mod tests {
         let decision = decide(&c, &payload);
         assert!(decision.route.is_none());
         assert_eq!(decision.source, MatchSource::Fallback);
+    }
+
+    #[test]
+    fn app_identifier_and_environment_match_together() {
+        let mut c = config();
+        c.route = vec![RouteConfig {
+            name: "store".into(),
+            destination_url: "http://store".into(),
+            matcher: RouteMatcher::from_extended(ExtendedRouteMatcher {
+                app_identifier: Some("com.example.store".into()),
+                environment: Some("production".into()),
+                ..ExtendedRouteMatcher::default()
+            }),
+        }];
+        let matching = serde_json::json!({
+            "data": {"bundleId":"com.example.store","environment":"production"}
+        });
+        assert_eq!(decide(&c, &matching).route.unwrap().name, "store");
+        let wrong_environment = serde_json::json!({
+            "data": {"bundleId":"com.example.store","environment":"sandbox"}
+        });
+        assert!(decide(&c, &wrong_environment).route.is_none());
+    }
+
+    #[test]
+    fn legacy_route_precedes_environment_only_route() {
+        let mut c = config();
+        c.route.push(RouteConfig {
+            name: "sandbox-store".into(),
+            destination_url: "http://store".into(),
+            matcher: RouteMatcher::from_extended(ExtendedRouteMatcher {
+                environment: Some("sandbox".into()),
+                ..ExtendedRouteMatcher::default()
+            }),
+        });
+        let payload = serde_json::json!({
+            "data": {"metadata": {"app": "timamu"}, "environment": "sandbox"}
+        });
+        assert_eq!(decide(&c, &payload).route.unwrap().name, "timamu");
     }
 
     #[test]

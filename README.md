@@ -2,18 +2,19 @@
 
 Maintained by Vant Inc.
 
-Paystack permits one webhook URL per business account. This service provides a
-single public endpoint for a small set of products, verifies the Paystack
-signature, stores the original request durably, and forwards the same bytes and
-signature to the selected product endpoint. It is intended for one business
-account, not as a hosted multi-customer service.
+The service provides one durable webhook endpoint for a small set of products.
+It verifies each source with its provider adapter, stores the original request,
+and forwards the same bytes and authentication headers to the selected product
+endpoint. It is intended for one business account, not as a hosted
+multi-customer service.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     P[Paystack] -->|raw POST| I["POST /in/{source}"]
-    I --> V[HMAC-SHA512 + IP check]
+    AS[Reserved store adapters] -.-> I
+    I --> V[Provider auth + IP check]
     V --> D[(Postgres events)]
     D --> Q[(Postgres deliveries)]
     Q --> W[Tokio delivery worker]
@@ -27,8 +28,13 @@ flowchart LR
 
 The ingest path does only authentication, JSON field extraction, routing,
 transactional persistence, and acknowledgement. Forwarding never runs inline.
-The destination receives the original body, `Content-Type`, and
-`x-paystack-signature`, plus `X-Fanout-Event-Id` and `X-Fanout-Attempt`.
+The destination receives the original body and authentication headers,
+unchanged, plus `X-Fanout-Event-Id` and `X-Fanout-Attempt`.
+
+The only implemented source provider is `paystack`. The source names
+`apple_server_notifications`, `google_play_rtdn`, and
+`apple_connect_webhooks` are reserved for later provider work; they reject
+requests until their authentication adapters are implemented.
 
 ## Quick start
 
@@ -112,10 +118,13 @@ The first matching route wins, using this precedence:
 3. `data.reference`, then `data.subscription_code`, then
    `data.customer_code` when a reference is absent. The configured value is a
    prefix.
+4. `app_identifier` matches a store bundle ID or package name.
+5. `environment` matches `production` or `sandbox`.
 
 Within a route, a configured matcher is a candidate for that precedence level;
-the other matchers do not have to be present. This lets a product use a
-metadata tag for one event family and a reference prefix for another.
+the other legacy matchers do not have to be present. `app_identifier` and
+`environment`, when both are configured, must both match. This lets a product
+route store notifications to the correct application and environment.
 
 If no route matches, `fallback.mode = "unrouted"` stores the event without a
 delivery and sends an alert. `fallback.mode = "route:name"` sends it to that
@@ -306,7 +315,8 @@ build.
 ## Project boundaries
 
 There is no billing, hosted multi-customer mode, or payload re-signing. The
-Provider trait is deliberately small so Flutterwave and Stripe can be added
-later without changing the queue contract; only Paystack is implemented now.
+Provider trait owns source authentication, event identity, event type, and
+routing fields so additional provider payloads do not change the queue
+contract.
 
 Use conventional commit messages. License: MIT.

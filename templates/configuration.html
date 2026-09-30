@@ -19,7 +19,7 @@
         {% endif %}
         {% if user.role.can_manage() %}
         <form method="post" action="/dashboard/config/source" class="stack-form config-form">
-            <input type="hidden" name="csrf" value="{{ csrf }}"><h3>Add or edit source</h3><label for="source-name">Name</label><input id="source-name" name="name" placeholder="paystack_main" required><label for="provider">Provider</label><input id="provider" name="provider" value="paystack" required><label for="secret">Secret <span class="muted">leave blank to keep the stored value</span></label><input id="secret" name="secret" type="password" autocomplete="new-password"><label for="allowed_ips">Allowed IPs <span class="muted">comma separated</span></label><input id="allowed_ips" name="allowed_ips" placeholder="52.31.139.75, 52.49.173.169"><label class="check-label"><input type="checkbox" name="enabled" checked> Enabled</label><button class="button button-primary" type="submit">Save source</button>
+            <input type="hidden" name="csrf" value="{{ csrf }}"><h3>Add or edit source</h3><label for="source-name">Name</label><input id="source-name" name="name" placeholder="paystack_main" required><label for="provider">Provider</label><select id="provider" name="provider"><option value="paystack">paystack</option></select><label for="secret">Secret <span class="muted">leave blank to keep the stored value</span></label><input id="secret" name="secret" type="password" autocomplete="new-password"><label for="allowed_ips">Allowed IPs <span class="muted">comma separated</span></label><input id="allowed_ips" name="allowed_ips" placeholder="52.31.139.75, 52.49.173.169"><label class="check-label"><input type="checkbox" name="enabled" checked> Enabled</label><button class="button button-primary" type="submit">Save source</button>
         </form>
         {% endif %}
     </article>
@@ -30,7 +30,7 @@
         <div class="config-list">
             {% for route in routes %}
             <div class="config-row">
-                <div><strong>{{ route.name }}</strong><small>{{ route.destination_url }} · {% if route.enabled %}enabled{% else %}disabled{% endif %}</small><small>{% if let Some(value) = route.matcher.metadata_app %}metadata.app={{ value }} {% endif %}{% if let Some(value) = route.matcher.plan_code_prefix %}plan={{ value }} {% endif %}{% if let Some(value) = route.matcher.reference_prefix %}reference={{ value }}{% endif %}</small></div>
+                <div><strong>{{ route.name }}</strong><small>{{ route.destination_url }} · {% if route.enabled %}enabled{% else %}disabled{% endif %}</small><small>{% if let Some(value) = route.matcher.metadata_app %}metadata.app={{ value }} {% endif %}{% if let Some(value) = route.matcher.plan_code_prefix %}plan={{ value }} {% endif %}{% if let Some(value) = route.matcher.reference_prefix %}reference={{ value }} {% endif %}{% if let Some(value) = route.app_identifier %}app={{ value }} {% endif %}{% if let Some(value) = route.environment %}environment={{ value }}{% endif %}</small></div>
                 {% if user.can_write %}<div class="row-actions"><a class="button button-secondary" href="/dashboard/config?edit={{ route.name }}">Edit</a><form method="post" action="/dashboard/config/route/{{ route.name }}/delete"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="button button-secondary" type="submit">Delete</button></form></div>{% endif %}
             </div>
             {% endfor %}
@@ -43,6 +43,8 @@
             <label for="metadata_app">Metadata app</label><input id="metadata_app" name="metadata_app" value="{{ editor.metadata_app }}" placeholder="timamu">
             <label for="plan_code_prefix">Plan code prefix</label><input id="plan_code_prefix" name="plan_code_prefix" value="{{ editor.plan_code_prefix }}" placeholder="PLN_tm">
             <label for="reference_prefix">Reference prefix</label><input id="reference_prefix" name="reference_prefix" value="{{ editor.reference_prefix }}" placeholder="tm_">
+            <label for="app_identifier">App identifier</label><input id="app_identifier" name="app_identifier" value="{{ editor.app_identifier }}" placeholder="com.example.app">
+            <label for="environment">Environment</label><select id="environment" name="environment"><option value="">Any</option><option value="production"{% if editor.environment == "production" %} selected{% endif %}>production</option><option value="sandbox"{% if editor.environment == "sandbox" %} selected{% endif %}>sandbox</option></select>
             <div class="two-col"><div><label for="timeout_seconds">Timeout seconds</label><input id="timeout_seconds" name="timeout_seconds" type="number" min="1" max="60" value="{{ editor.timeout_seconds }}"></div><div><label for="max_attempts">Max attempts</label><input id="max_attempts" name="max_attempts" type="number" min="1" max="10" value="{{ editor.max_attempts }}"></div></div>
             <label class="check-label"><input type="checkbox" name="enabled"{% if editor.enabled %} checked{% endif %}> Enabled</label>
             <div class="row-actions"><button class="button button-primary" type="submit">Save route</button>{% if editor.editing %}<a class="button button-secondary" href="/dashboard/config">Cancel</a>{% endif %}</div>

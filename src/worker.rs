@@ -2,6 +2,7 @@ use std::{sync::Arc, time::Instant};
 
 use chrono::Utc;
 use futures_util::StreamExt;
+use serde_json::Value;
 use tokio::time::{Duration, sleep};
 
 use crate::{app::AppState, db::ClaimedDelivery};
@@ -39,12 +40,37 @@ pub async fn run_worker(state: Arc<AppState>) {
 pub async fn process_one(state: &AppState, delivery: ClaimedDelivery) {
     let started = Utc::now();
     let timer = Instant::now();
-    let request = state
-        .http
-        .post(&delivery.destination_url)
-        .header("content-type", &delivery.content_type)
-        .header("x-paystack-signature", &delivery.signature)
-        .header("x-fanout-event-id", delivery.event_id.to_string())
+    let mut request = state.http.post(&delivery.destination_url);
+    let mut has_content_type = false;
+    if let Some(headers) = delivery.headers.as_object() {
+        for (name, value) in headers {
+            if !forwardable_header(name) {
+                continue;
+            }
+            has_content_type |= name.eq_ignore_ascii_case("content-type");
+            match value {
+                Value::String(value) => {
+                    request = request.header(name, value);
+                }
+                Value::Array(values) => {
+                    for value in values.iter().filter_map(Value::as_str) {
+                        request = request.header(name, value);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if !has_content_type {
+        request = request.header("content-type", &delivery.content_type);
+    }
+    let fanout_event_id = if delivery.provider_event_id.is_empty() {
+        delivery.event_id.to_string()
+    } else {
+        delivery.provider_event_id.clone()
+    };
+    let request = request
+        .header("x-fanout-event-id", fanout_event_id)
         .header("x-fanout-attempt", delivery.attempt.to_string())
         .body(delivery.raw_body.clone())
         .send()
@@ -106,6 +132,20 @@ pub async fn process_one(state: &AppState, delivery: ClaimedDelivery) {
             .await;
         }
     }
+}
+
+fn forwardable_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "content-type"
+            | "authorization"
+            | "x-paystack-signature"
+            | "x-apple-signature"
+            | "x-apple-notification-signature"
+            | "x-apple-connect-signature"
+            | "x-google-signature"
+            | "x-goog-signature"
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

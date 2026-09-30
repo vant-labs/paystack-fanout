@@ -45,6 +45,7 @@ impl Modify for BearerAuth {
             crate::db::EventDetail,
             crate::db::AttemptView,
             crate::db::DatabaseRoute,
+            crate::db::DatabaseRouteResponse,
             crate::db::DeliveryView,
             crate::db::SettingView,
             crate::app::ReplayBody,
