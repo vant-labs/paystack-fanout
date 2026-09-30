@@ -117,8 +117,9 @@ Set route `app_identifier` to the app's bundle ID and `environment` to
 [Apple PKI](https://www.apple.com/certificateauthority/); the signed payload
 format and `x5c` chain are described in Apple's
 [signedPayload](https://developer.apple.com/documentation/appstoreserverapi/signedpayload)
-and [JWSDecodedHeader](https://developer.apple.com/documentation/appstoreserverapi/jwsdecodedheader)
-references.
+and [JWSDecodedHeader](https://developer.apple.com/documentation/appstoreserverapi/jwsdecodedheader).
+The bundled certificate is stored at `src/certs/apple/AppleRootCA-G3.cer` for
+container builds.
 
 An alert destination may be enabled with:
 

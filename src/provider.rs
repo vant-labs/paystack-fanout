@@ -205,7 +205,7 @@ impl Provider for UnimplementedProvider {
 static PAYSTACK: PaystackProvider = PaystackProvider;
 static APPLE_SERVER_NOTIFICATIONS: AppleServerNotificationsProvider =
     AppleServerNotificationsProvider::with_trusted_root(include_bytes!(
-        "../certs/apple/AppleRootCA-G3.cer"
+        "certs/apple/AppleRootCA-G3.cer"
     ));
 static GOOGLE_PLAY_RTDN: UnimplementedProvider = UnimplementedProvider {
     name: "google_play_rtdn",
