@@ -1,0 +1,12 @@
+{
+  "data": {
+    "type": "buildUploadStateUpdated",
+    "id": "build-event-1",
+    "attributes": {
+      "appId": "123456789",
+      "newValue": "COMPLETE",
+      "oldValue": "PROCESSING",
+      "timestamp": "2026-09-30T12:00:00Z"
+    }
+  }
+}

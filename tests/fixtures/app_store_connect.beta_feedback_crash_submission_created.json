@@ -1,0 +1,10 @@
+{
+  "data": {
+    "type": "betaFeedbackCrashSubmissionCreated",
+    "id": "crash-event-1",
+    "attributes": {
+      "appId": "123456789",
+      "timestamp": "2026-09-30T12:00:00Z"
+    }
+  }
+}

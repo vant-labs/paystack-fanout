@@ -7,7 +7,7 @@ use ring::signature::{ECDSA_P256_SHA256_FIXED, UnparsedPublicKey};
 use serde_json::Value;
 use x509_parser::prelude::parse_x509_certificate;
 
-use crate::security::{dedupe_key, verify_signature};
+use crate::security::{dedupe_key, verify_hmac_sha256_signature, verify_signature};
 
 /// The normalized fields a provider exposes to the routing layer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -171,6 +171,64 @@ impl Provider for AppleServerNotificationsProvider {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AppStoreConnectWebhooksProvider;
+
+impl Provider for AppStoreConnectWebhooksProvider {
+    fn name(&self) -> &'static str {
+        "apple_connect_webhooks"
+    }
+
+    fn authenticate(&self, secret: &[u8], headers: &HeaderMap, raw_body: &[u8]) -> bool {
+        verify_hmac_sha256_signature(
+            secret,
+            raw_body,
+            headers
+                .get("x-apple-signature")
+                .and_then(|value| value.to_str().ok()),
+        )
+    }
+
+    fn auth_header_names(&self) -> &'static [&'static str] {
+        &["x-apple-signature"]
+    }
+
+    fn event_type(&self, payload: &Value) -> String {
+        ["eventType", "type", "data.eventType", "data.type"]
+            .iter()
+            .find_map(|path| string_at_path(payload, path))
+            .unwrap_or_else(|| "unknown".to_owned())
+    }
+
+    fn event_id(&self, payload: &Value, raw_body: &[u8]) -> String {
+        ["eventId", "id", "data.eventId", "data.id"]
+            .iter()
+            .find_map(|path| string_at_path(payload, path))
+            .unwrap_or_else(|| dedupe_key(raw_body))
+    }
+
+    fn routing_fields(&self, payload: &Value) -> RoutingFields {
+        RoutingFields {
+            app_identifier: [
+                "appId",
+                "app_id",
+                "bundleId",
+                "bundle_id",
+                "data.appId",
+                "data.app_id",
+                "data.bundleId",
+                "data.bundle_id",
+                "data.attributes.appId",
+                "data.attributes.bundleId",
+                "data.relationships.app.data.id",
+            ]
+            .iter()
+            .find_map(|path| string_at_path(payload, path)),
+            ..RoutingFields::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct UnimplementedProvider {
     name: &'static str,
@@ -207,11 +265,9 @@ static APPLE_SERVER_NOTIFICATIONS: AppleServerNotificationsProvider =
     AppleServerNotificationsProvider::with_trusted_root(include_bytes!(
         "certs/apple/AppleRootCA-G3.cer"
     ));
+static APPLE_CONNECT_WEBHOOKS: AppStoreConnectWebhooksProvider = AppStoreConnectWebhooksProvider;
 static GOOGLE_PLAY_RTDN: UnimplementedProvider = UnimplementedProvider {
     name: "google_play_rtdn",
-};
-static APPLE_CONNECT_WEBHOOKS: UnimplementedProvider = UnimplementedProvider {
-    name: "apple_connect_webhooks",
 };
 
 pub fn provider_for(name: &str) -> Option<&'static dyn Provider> {
@@ -233,8 +289,19 @@ pub fn known_providers() -> [&'static str; 4] {
     ]
 }
 
-pub fn supported_providers() -> [&'static str; 2] {
-    ["paystack", "apple_server_notifications"]
+pub fn supported_providers() -> [&'static str; 3] {
+    [
+        "paystack",
+        "apple_server_notifications",
+        "apple_connect_webhooks",
+    ]
+}
+
+fn string_at_path(payload: &Value, path: &str) -> Option<String> {
+    path.split('.')
+        .try_fold(payload, |value, key| value.get(key))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 fn event_id_from_paths(payload: &Value, paths: &[&str]) -> Option<String> {
@@ -498,15 +565,49 @@ mod tests {
     fn store_providers_are_explicitly_unimplemented() {
         let apple = provider_for("apple_server_notifications").unwrap();
         assert!(apple.implemented());
-        for name in ["google_play_rtdn", "apple_connect_webhooks"] {
-            let provider = provider_for(name).unwrap();
-            assert!(!provider.implemented());
-            assert!(!provider.authenticate(b"secret", &HeaderMap::new(), b"{}"));
-        }
+        let app_store_connect = provider_for("apple_connect_webhooks").unwrap();
+        assert!(app_store_connect.implemented());
+        let provider = provider_for("google_play_rtdn").unwrap();
+        assert!(!provider.implemented());
+        assert!(!provider.authenticate(b"secret", &HeaderMap::new(), b"{}"));
         assert_eq!(
             supported_providers(),
-            ["paystack", "apple_server_notifications"]
+            [
+                "paystack",
+                "apple_server_notifications",
+                "apple_connect_webhooks"
+            ]
         );
+    }
+
+    #[test]
+    fn app_store_connect_webhooks_verify_signature_and_extract_fields() {
+        let provider = AppStoreConnectWebhooksProvider;
+        let payload = serde_json::json!({
+            "data": {
+                "type": "buildUploadStateUpdated",
+                "id": "event-1",
+                "attributes": {"appId": "123456789"}
+            }
+        });
+        let body = serde_json::to_vec(&payload).unwrap();
+        let secret = b"app-store-connect-secret";
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret).unwrap();
+        mac.update(&body);
+        let signature = format!("hmacsha256={}", hex::encode(mac.finalize().into_bytes()));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-apple-signature", signature.parse().unwrap());
+        assert!(provider.authenticate(secret, &headers, &body));
+        assert_eq!(provider.event_type(&payload), "buildUploadStateUpdated");
+        assert_eq!(provider.event_id(&payload, &body), "event-1");
+        assert_eq!(
+            provider.routing_fields(&payload).app_identifier.as_deref(),
+            Some("123456789")
+        );
+        assert!(!provider.authenticate(b"wrong", &headers, &body));
+        let mut tampered = body.clone();
+        tampered[0] = b' ';
+        assert!(!provider.authenticate(secret, &headers, &tampered));
     }
 
     struct SignedNotification {

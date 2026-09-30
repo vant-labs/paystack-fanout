@@ -2,6 +2,7 @@ use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256, Sha512};
 use subtle::ConstantTimeEq;
 
+type HmacSha256 = Hmac<Sha256>;
 type HmacSha512 = Hmac<Sha512>;
 
 pub fn verify_signature(secret: &[u8], body: &[u8], provided: Option<&str>) -> bool {
@@ -17,6 +18,21 @@ pub fn verify_signature(secret: &[u8], body: &[u8], provided: Option<&str>) -> b
     mac.update(body);
     let expected = mac.finalize().into_bytes();
     expected.as_slice().ct_eq(&expected_bytes).into()
+}
+
+pub fn verify_hmac_sha256_signature(secret: &[u8], body: &[u8], provided: Option<&str>) -> bool {
+    let Some(provided) = provided.and_then(|value| value.strip_prefix("hmacsha256=")) else {
+        return false;
+    };
+    let Ok(provided_bytes) = hex::decode(provided) else {
+        return false;
+    };
+    let Ok(mut mac) = HmacSha256::new_from_slice(secret) else {
+        return false;
+    };
+    mac.update(body);
+    let expected = mac.finalize().into_bytes();
+    expected.as_slice().ct_eq(&provided_bytes).into()
 }
 
 pub fn dedupe_key(body: &[u8]) -> String {
@@ -52,5 +68,31 @@ mod tests {
         ));
         assert!(!verify_signature(b"wrong", body, Some(&signature)));
         assert!(!verify_signature(secret, body, None));
+    }
+
+    #[test]
+    fn app_store_connect_signature_cases() {
+        let secret = b"app-store-connect-secret";
+        let body = br#"{"data":{"type":"BUILD_UPLOAD_STATE_UPDATED"}}"#;
+        let mut mac = HmacSha256::new_from_slice(secret).unwrap();
+        mac.update(body);
+        let signature = format!("hmacsha256={}", hex::encode(mac.finalize().into_bytes()));
+        assert!(verify_hmac_sha256_signature(secret, body, Some(&signature)));
+        assert!(!verify_hmac_sha256_signature(
+            secret,
+            br#"{"data":{"type":"tampered"}}"#,
+            Some(&signature)
+        ));
+        assert!(!verify_hmac_sha256_signature(
+            b"wrong",
+            body,
+            Some(&signature)
+        ));
+        assert!(!verify_hmac_sha256_signature(secret, body, None));
+        assert!(!verify_hmac_sha256_signature(
+            secret,
+            body,
+            Some("deadbeef")
+        ));
     }
 }

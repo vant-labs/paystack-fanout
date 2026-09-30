@@ -15,7 +15,7 @@ flowchart LR
     P[Paystack] -->|raw POST| I["POST /in/{source}"]
     AS[Apple Server Notifications V2] --> I
     GP[Reserved Google RTDN adapter] -.-> I
-    AC[Reserved Apple Connect adapter] -.-> I
+    AC[App Store Connect webhooks] --> I
     I --> V[Provider auth + IP check]
     V --> D[(Postgres events)]
     D --> Q[(Postgres deliveries)]
@@ -33,10 +33,10 @@ transactional persistence, and acknowledgement. Forwarding never runs inline.
 The destination receives the original body and authentication headers,
 unchanged, plus `X-Fanout-Event-Id` and `X-Fanout-Attempt`.
 
-The implemented source providers are `paystack` and
-`apple_server_notifications`. The source names `google_play_rtdn` and
-`apple_connect_webhooks` are reserved for later provider work; they reject
-requests until their authentication adapters are implemented.
+The implemented source providers are `paystack`,
+`apple_server_notifications`, and `apple_connect_webhooks`. The source name
+`google_play_rtdn` remains reserved for later provider work and rejects
+requests until its authentication adapter is implemented.
 
 ## Quick start
 
@@ -120,6 +120,26 @@ format and `x5c` chain are described in Apple's
 and [JWSDecodedHeader](https://developer.apple.com/documentation/appstoreserverapi/jwsdecodedheader).
 The bundled certificate is stored at `src/certs/apple/AppleRootCA-G3.cer` for
 container builds.
+
+### App Store Connect webhooks
+
+Configure an App Store Connect webhook source with provider
+`apple_connect_webhooks`. App Store Connect sends the original JSON body and an
+`x-apple-signature` header in the form `hmacsha256=<hex>`. The adapter verifies
+the body with the secret configured for the webhook, then forwards the body and
+signature unchanged. Event type comes from the webhook event `type` and the
+event ID comes from its `id`; the app ID is taken from the documented app
+fields when present and is used for route matching.
+
+In App Store Connect, open Users and Access → Integrations → Webhooks, create a
+webhook, enter the payload URL `/in/{source}`, choose the app, set a secret,
+and select the event triggers. The current event families include build upload
+state, app version state, beta feedback crash, and beta feedback screenshot
+events. Use a route with `app_identifier` for an app-specific destination, or
+set the fallback to `route:<name>` for a whole-account destination. Keep these
+routes separate from payment routes.
+
+Apple's current setup and signing details are documented in [Manage webhooks](https://developer.apple.com/help/app-store-connect/manage-your-team/manage-webhooks), [Configuring and parsing webhook notifications](https://developer.apple.com/documentation/appstoreconnectapi/configuring-webhook-notifications), and [WebhookEventType](https://developer.apple.com/documentation/appstoreconnectapi/webhookeventtype).
 
 An alert destination may be enabled with:
 
