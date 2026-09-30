@@ -1,7 +1,7 @@
 use std::{collections::HashMap, env, net::IpAddr, path::Path};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -34,11 +34,113 @@ pub struct RouteConfig {
     pub matcher: RouteMatcher,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RouteMatcher {
     pub metadata_app: Option<String>,
     pub plan_code_prefix: Option<String>,
     pub reference_prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ExtendedRouteMatcher {
+    #[serde(default)]
+    pub metadata_app: Option<String>,
+    #[serde(default)]
+    pub plan_code_prefix: Option<String>,
+    #[serde(default)]
+    pub reference_prefix: Option<String>,
+    #[serde(alias = "app_id")]
+    pub app_identifier: Option<String>,
+    pub environment: Option<String>,
+}
+
+const EXTENDED_MATCHER_PREFIX: &str = "__fanout_extended_matcher__:";
+
+impl RouteMatcher {
+    pub fn extended(&self) -> ExtendedRouteMatcher {
+        let Some(encoded) = self
+            .metadata_app
+            .as_deref()
+            .and_then(|value| value.strip_prefix(EXTENDED_MATCHER_PREFIX))
+        else {
+            return ExtendedRouteMatcher {
+                metadata_app: self.metadata_app.clone(),
+                plan_code_prefix: self.plan_code_prefix.clone(),
+                reference_prefix: self.reference_prefix.clone(),
+                ..ExtendedRouteMatcher::default()
+            };
+        };
+        let mut matcher: ExtendedRouteMatcher = serde_json::from_str(encoded).unwrap_or_default();
+        matcher.plan_code_prefix = self.plan_code_prefix.clone();
+        matcher.reference_prefix = self.reference_prefix.clone();
+        matcher
+    }
+
+    pub fn from_extended(matcher: ExtendedRouteMatcher) -> Self {
+        let ExtendedRouteMatcher {
+            metadata_app,
+            plan_code_prefix,
+            reference_prefix,
+            app_identifier,
+            environment,
+        } = matcher;
+        let metadata_app = if app_identifier.is_some() || environment.is_some() {
+            let encoded = serde_json::to_string(&ExtendedRouteMatcher {
+                metadata_app,
+                plan_code_prefix: None,
+                reference_prefix: None,
+                app_identifier,
+                environment,
+            })
+            .unwrap_or_default();
+            Some(format!("{EXTENDED_MATCHER_PREFIX}{encoded}"))
+        } else {
+            metadata_app
+        };
+        Self {
+            metadata_app,
+            plan_code_prefix,
+            reference_prefix,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RouteMatcherWire {
+    #[serde(default)]
+    metadata_app: Option<String>,
+    #[serde(default)]
+    plan_code_prefix: Option<String>,
+    #[serde(default)]
+    reference_prefix: Option<String>,
+    #[serde(alias = "app_id")]
+    app_identifier: Option<String>,
+    environment: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for RouteMatcher {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = RouteMatcherWire::deserialize(deserializer)?;
+        Ok(Self::from_extended(ExtendedRouteMatcher {
+            metadata_app: wire.metadata_app,
+            plan_code_prefix: wire.plan_code_prefix,
+            reference_prefix: wire.reference_prefix,
+            app_identifier: wire.app_identifier,
+            environment: wire.environment,
+        }))
+    }
+}
+
+impl Serialize for RouteMatcher {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.extended().serialize(serializer)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -140,9 +242,19 @@ impl Config {
         );
         for source in self.source.values() {
             anyhow::ensure!(
-                source.provider == "paystack",
-                "only paystack is implemented"
+                crate::provider::supported_providers().contains(&source.provider.as_str()),
+                "unsupported provider {}",
+                source.provider
             );
+        }
+        for route in &self.route {
+            if let Some(environment) = route.matcher.extended().environment.as_deref() {
+                anyhow::ensure!(
+                    matches!(environment, "production" | "sandbox"),
+                    "route {} environment must be production or sandbox",
+                    route.name
+                );
+            }
         }
         Ok(())
     }
@@ -163,5 +275,36 @@ mod tests {
         assert!(config.route.is_empty());
         assert_eq!(config.fallback.mode, "unrouted");
         assert_eq!(config.retention_days, 90);
+    }
+
+    #[test]
+    fn store_sources_and_matchers_are_valid_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[source.apple]
+provider = "apple_server_notifications"
+secret_env = "APPLE_SECRET"
+
+[[route]]
+name = "store"
+destination_url = "https://example.invalid/store"
+match = { app_identifier = "com.example.store", environment = "sandbox" }
+
+[fallback]
+mode = "unrouted"
+"#,
+        )
+        .unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+        assert_eq!(
+            config.source["apple"].provider,
+            "apple_server_notifications"
+        );
+        let matcher = config.route[0].matcher.extended();
+        assert_eq!(matcher.app_identifier.as_deref(), Some("com.example.store"));
+        assert_eq!(matcher.environment.as_deref(), Some("sandbox"));
     }
 }

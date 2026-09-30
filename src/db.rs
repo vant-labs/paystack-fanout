@@ -10,7 +10,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::auth::{Role, SessionUser, token_hash};
-use crate::config::{Config, RouteConfig, RouteMatcher, SourceConfig};
+use crate::config::{Config, ExtendedRouteMatcher, RouteConfig, RouteMatcher, SourceConfig};
 use crate::crypto::{decrypt, encrypt};
 
 #[derive(Clone)]
@@ -26,6 +26,7 @@ pub struct ClaimedDelivery {
     pub raw_body: Vec<u8>,
     pub content_type: String,
     pub signature: String,
+    pub headers: Value,
     pub destination_url: String,
     pub max_attempts: i32,
 }
@@ -132,6 +133,8 @@ pub struct RouteView {
     pub name: String,
     pub destination_url: String,
     pub matcher: RouteMatcher,
+    pub app_identifier: Option<String>,
+    pub environment: Option<String>,
     pub timeout_seconds: i32,
     pub max_attempts: i32,
     pub enabled: bool,
@@ -145,6 +148,41 @@ pub struct DatabaseRoute {
     pub ref_prefix: Option<String>,
     pub metadata_app: Option<String>,
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DatabaseRouteRecord {
+    pub route: DatabaseRoute,
+    pub matcher: ExtendedRouteMatcher,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct DatabaseRouteResponse {
+    pub id: Uuid,
+    pub name: String,
+    pub target_url: String,
+    pub metadata_app: Option<String>,
+    pub plan_code_prefix: Option<String>,
+    pub reference_prefix: Option<String>,
+    pub app_identifier: Option<String>,
+    pub environment: Option<String>,
+    pub enabled: bool,
+}
+
+impl From<DatabaseRouteRecord> for DatabaseRouteResponse {
+    fn from(record: DatabaseRouteRecord) -> Self {
+        Self {
+            id: record.route.id,
+            name: record.route.name,
+            target_url: record.route.target_url,
+            metadata_app: record.matcher.metadata_app,
+            plan_code_prefix: record.matcher.plan_code_prefix,
+            reference_prefix: record.matcher.reference_prefix,
+            app_identifier: record.matcher.app_identifier,
+            environment: record.matcher.environment,
+            enabled: record.route.enabled,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -222,13 +260,14 @@ impl Database {
         }
         if route_count == 0 {
             for route in &config.route {
+                let matcher = route.matcher.extended();
                 sqlx::query("INSERT INTO routes (id, name, destination_url, target_url, matcher, ref_prefix, metadata_app, created_at, updated_at) VALUES ($1, $2, $3, $3, $4, $5, $6, now(), now())")
                     .bind(Uuid::new_v4())
                     .bind(&route.name)
                     .bind(&route.destination_url)
-                    .bind(serde_json::to_value(&route.matcher)?)
-                    .bind(&route.matcher.reference_prefix)
-                    .bind(&route.matcher.metadata_app)
+                    .bind(serde_json::to_value(&matcher)?)
+                    .bind(&matcher.reference_prefix)
+                    .bind(&matcher.metadata_app)
                     .execute(&mut *tx)
                     .await?;
             }
@@ -320,7 +359,7 @@ impl Database {
                     let name: String = row.try_get("name").ok()?;
                     let destination_url: String = row.try_get("destination_url").ok()?;
                     let matcher: Value = row.try_get("matcher").ok()?;
-                    let mut matcher: RouteMatcher = serde_json::from_value(matcher).ok()?;
+                    let mut matcher: ExtendedRouteMatcher = serde_json::from_value(matcher).ok()?;
                     matcher.reference_prefix =
                         row.try_get("ref_prefix").ok().or(matcher.reference_prefix);
                     matcher.metadata_app =
@@ -328,7 +367,7 @@ impl Database {
                     Some(RouteConfig {
                         name,
                         destination_url,
-                        matcher,
+                        matcher: RouteMatcher::from_extended(matcher),
                     })
                 })
                 .collect();
@@ -454,10 +493,19 @@ impl Database {
         rows.into_iter()
             .map(|row| {
                 let matcher: Value = row.try_get("matcher")?;
+                let matcher: RouteMatcher = serde_json::from_value(matcher).unwrap_or_default();
+                let extended = matcher.extended();
+                let legacy_matcher = RouteMatcher {
+                    metadata_app: extended.metadata_app.clone(),
+                    plan_code_prefix: extended.plan_code_prefix.clone(),
+                    reference_prefix: extended.reference_prefix.clone(),
+                };
                 Ok(RouteView {
                     name: row.try_get("name")?,
                     destination_url: row.try_get("destination_url")?,
-                    matcher: serde_json::from_value(matcher).unwrap_or_default(),
+                    app_identifier: extended.app_identifier,
+                    environment: extended.environment,
+                    matcher: legacy_matcher,
                     timeout_seconds: row.try_get("timeout_seconds")?,
                     max_attempts: row.try_get("max_attempts")?,
                     enabled: row.try_get("enabled")?,
@@ -468,6 +516,15 @@ impl Database {
     }
 
     pub async fn list_database_routes(&self) -> Result<Vec<DatabaseRoute>> {
+        Ok(self
+            .list_database_route_records()
+            .await?
+            .into_iter()
+            .map(|record| record.route)
+            .collect())
+    }
+
+    pub async fn list_database_route_records(&self) -> Result<Vec<DatabaseRouteRecord>> {
         let rows = sqlx::query(
             "SELECT id, name, COALESCE(target_url, destination_url) AS target_url, ref_prefix, metadata_app, matcher, enabled FROM routes ORDER BY name",
         )
@@ -476,22 +533,41 @@ impl Database {
         rows.into_iter()
             .map(|row| {
                 let matcher: Value = row.try_get("matcher")?;
-                let matcher: RouteMatcher = serde_json::from_value(matcher).unwrap_or_default();
-                Ok(DatabaseRoute {
-                    id: row.try_get("id")?,
-                    name: row.try_get("name")?,
-                    target_url: row.try_get("target_url")?,
-                    ref_prefix: row
-                        .try_get::<Option<String>, _>("ref_prefix")?
-                        .or(matcher.reference_prefix),
-                    metadata_app: row
-                        .try_get::<Option<String>, _>("metadata_app")?
-                        .or(matcher.metadata_app),
-                    enabled: row.try_get("enabled")?,
+                let mut matcher: ExtendedRouteMatcher =
+                    serde_json::from_value(matcher).unwrap_or_default();
+                let ref_prefix: Option<String> = row
+                    .try_get::<Option<String>, _>("ref_prefix")?
+                    .or(matcher.reference_prefix.clone());
+                let metadata_app: Option<String> = row
+                    .try_get::<Option<String>, _>("metadata_app")?
+                    .or(matcher.metadata_app.clone());
+                matcher.reference_prefix = ref_prefix.clone();
+                matcher.metadata_app = metadata_app.clone();
+                Ok(DatabaseRouteRecord {
+                    route: DatabaseRoute {
+                        id: row.try_get("id")?,
+                        name: row.try_get("name")?,
+                        target_url: row.try_get("target_url")?,
+                        ref_prefix,
+                        metadata_app,
+                        enabled: row.try_get("enabled")?,
+                    },
+                    matcher,
                 })
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()
             .map_err(Into::into)
+    }
+
+    pub async fn find_database_route_record(
+        &self,
+        name: &str,
+    ) -> Result<Option<DatabaseRouteRecord>> {
+        Ok(self
+            .list_database_route_records()
+            .await?
+            .into_iter()
+            .find(|route| route.route.name == name))
     }
 
     pub async fn find_database_route(&self, name: &str) -> Result<Option<DatabaseRoute>> {
@@ -510,6 +586,34 @@ impl Database {
         metadata_app: Option<&str>,
         enabled: bool,
     ) -> Result<DatabaseRoute> {
+        self.create_database_route_with_matcher(
+            name,
+            target_url,
+            &ExtendedRouteMatcher {
+                metadata_app: metadata_app.map(str::to_owned),
+                reference_prefix: ref_prefix.map(str::to_owned),
+                ..ExtendedRouteMatcher::default()
+            },
+            enabled,
+        )
+        .await
+    }
+
+    pub async fn create_database_route_with_matcher(
+        &self,
+        name: &str,
+        target_url: &str,
+        matcher: &ExtendedRouteMatcher,
+        enabled: bool,
+    ) -> Result<DatabaseRoute> {
+        anyhow::ensure!(
+            matcher.metadata_app.is_some()
+                || matcher.plan_code_prefix.is_some()
+                || matcher.reference_prefix.is_some()
+                || matcher.app_identifier.is_some()
+                || matcher.environment.is_some(),
+            "at least one match rule is required"
+        );
         let id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO routes (id, name, destination_url, target_url, matcher, ref_prefix, metadata_app, max_attempts, enabled, created_at, updated_at) VALUES ($1, $2, $3, $3, $4, $5, $6, 3, $7, now(), now())",
@@ -517,12 +621,9 @@ impl Database {
         .bind(id)
         .bind(name)
         .bind(target_url)
-        .bind(serde_json::json!({
-            "reference_prefix": ref_prefix,
-            "metadata_app": metadata_app
-        }))
-        .bind(ref_prefix)
-        .bind(metadata_app)
+        .bind(serde_json::to_value(matcher)?)
+        .bind(&matcher.reference_prefix)
+        .bind(&matcher.metadata_app)
         .bind(enabled)
         .execute(&self.pool)
         .await?;
@@ -530,8 +631,8 @@ impl Database {
             id,
             name: name.to_owned(),
             target_url: target_url.to_owned(),
-            ref_prefix: ref_prefix.map(str::to_owned),
-            metadata_app: metadata_app.map(str::to_owned),
+            ref_prefix: matcher.reference_prefix.clone(),
+            metadata_app: matcher.metadata_app.clone(),
             enabled,
         })
     }
@@ -544,20 +645,59 @@ impl Database {
         metadata_app: Option<Option<&str>>,
         enabled: Option<bool>,
     ) -> Result<Option<DatabaseRoute>> {
-        let current = self.find_database_route(name).await?;
+        self.update_database_route_with_matcher(
+            name,
+            target_url,
+            ref_prefix,
+            metadata_app,
+            None,
+            None,
+            None,
+            enabled,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_database_route_with_matcher(
+        &self,
+        name: &str,
+        target_url: Option<&str>,
+        ref_prefix: Option<Option<&str>>,
+        metadata_app: Option<Option<&str>>,
+        plan_code_prefix: Option<Option<&str>>,
+        app_identifier: Option<Option<&str>>,
+        environment: Option<Option<&str>>,
+        enabled: Option<bool>,
+    ) -> Result<Option<DatabaseRoute>> {
+        let current = self.find_database_route_record(name).await?;
         let Some(current) = current else {
             return Ok(None);
         };
-        let target_url = target_url.unwrap_or(&current.target_url);
-        let ref_prefix = ref_prefix
-            .map(|value| value.map(str::to_owned))
-            .unwrap_or(current.ref_prefix.clone());
-        let metadata_app = metadata_app
-            .map(|value| value.map(str::to_owned))
-            .unwrap_or(current.metadata_app.clone());
-        let enabled = enabled.unwrap_or(current.enabled);
+        let target_url = target_url.unwrap_or(&current.route.target_url);
+        let mut matcher = current.matcher;
+        if let Some(value) = ref_prefix {
+            matcher.reference_prefix = value.map(str::to_owned);
+        }
+        if let Some(value) = metadata_app {
+            matcher.metadata_app = value.map(str::to_owned);
+        }
+        if let Some(value) = plan_code_prefix {
+            matcher.plan_code_prefix = value.map(str::to_owned);
+        }
+        if let Some(value) = app_identifier {
+            matcher.app_identifier = value.map(str::to_owned);
+        }
+        if let Some(value) = environment {
+            matcher.environment = value.map(str::to_owned);
+        }
+        let enabled = enabled.unwrap_or(current.route.enabled);
         anyhow::ensure!(
-            ref_prefix.is_some() || metadata_app.is_some(),
+            matcher.metadata_app.is_some()
+                || matcher.plan_code_prefix.is_some()
+                || matcher.reference_prefix.is_some()
+                || matcher.app_identifier.is_some()
+                || matcher.environment.is_some(),
             "at least one match rule is required"
         );
         sqlx::query(
@@ -565,21 +705,18 @@ impl Database {
         )
         .bind(name)
         .bind(target_url)
-        .bind(serde_json::json!({
-            "reference_prefix": ref_prefix,
-            "metadata_app": metadata_app
-        }))
-        .bind(ref_prefix.as_deref())
-        .bind(metadata_app.as_deref())
+        .bind(serde_json::to_value(&matcher)?)
+        .bind(matcher.reference_prefix.as_deref())
+        .bind(matcher.metadata_app.as_deref())
         .bind(enabled)
         .execute(&self.pool)
         .await?;
         Ok(Some(DatabaseRoute {
-            id: current.id,
+            id: current.route.id,
             name: name.to_owned(),
             target_url: target_url.to_owned(),
-            ref_prefix,
-            metadata_app,
+            ref_prefix: matcher.reference_prefix,
+            metadata_app: matcher.metadata_app,
             enabled,
         }))
     }
@@ -759,13 +896,14 @@ impl Database {
         max_attempts: i32,
         enabled: bool,
     ) -> Result<()> {
+        let extended_matcher = matcher.extended();
         sqlx::query("INSERT INTO routes (id, name, destination_url, target_url, matcher, ref_prefix, metadata_app, timeout_seconds, max_attempts, enabled, created_at, updated_at) VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, $9, now(), now()) ON CONFLICT (name) DO UPDATE SET destination_url = EXCLUDED.destination_url, target_url = EXCLUDED.target_url, matcher = EXCLUDED.matcher, ref_prefix = EXCLUDED.ref_prefix, metadata_app = EXCLUDED.metadata_app, timeout_seconds = EXCLUDED.timeout_seconds, max_attempts = EXCLUDED.max_attempts, enabled = EXCLUDED.enabled, updated_at = now()")
             .bind(Uuid::new_v4())
             .bind(name)
             .bind(destination_url)
-            .bind(serde_json::to_value(matcher)?)
-            .bind(&matcher.reference_prefix)
-            .bind(&matcher.metadata_app)
+            .bind(serde_json::to_value(&extended_matcher)?)
+            .bind(&extended_matcher.reference_prefix)
+            .bind(&extended_matcher.metadata_app)
             .bind(timeout_seconds)
             .bind(max_attempts)
             .bind(enabled)
@@ -1155,7 +1293,7 @@ impl Database {
     pub async fn claim_delivery(&self) -> Result<Option<ClaimedDelivery>> {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            r#"SELECT d.id as delivery_id, d.event_id, d.attempts, e.raw_body, e.content_type, e.signature, d.destination_url, COALESCE(r.max_attempts, 10) AS max_attempts
+            r#"SELECT d.id as delivery_id, d.event_id, d.attempts, e.raw_body, e.content_type, e.signature, e.headers, d.destination_url, COALESCE(r.max_attempts, 10) AS max_attempts
                FROM deliveries d JOIN events e ON e.id = d.event_id
                LEFT JOIN routes r ON r.id = d.route_id
                WHERE ((d.status IN ('pending', 'retrying') AND d.next_attempt_at <= now())
@@ -1183,6 +1321,7 @@ impl Database {
             raw_body: row.try_get("raw_body")?,
             content_type: row.try_get("content_type")?,
             signature: row.try_get("signature")?,
+            headers: row.try_get("headers")?,
             destination_url: row.try_get("destination_url")?,
             max_attempts: row.try_get("max_attempts")?,
         }))
