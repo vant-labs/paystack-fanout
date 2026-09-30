@@ -1185,12 +1185,23 @@ async fn save_route(
         )
             .into_response();
     }
+    let environment = clean_option(form.environment);
+    if !environment
+        .as_deref()
+        .is_none_or(|value| matches!(value, "production" | "sandbox"))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Environment must be production or sandbox",
+        )
+            .into_response();
+    }
     let matcher = RouteMatcher::from_extended(ExtendedRouteMatcher {
         metadata_app: clean_option(form.metadata_app),
         plan_code_prefix: clean_option(form.plan_code_prefix),
         reference_prefix: clean_option(form.reference_prefix),
         app_identifier: clean_option(form.app_identifier),
-        environment: clean_option(form.environment),
+        environment,
     });
     match state
         .db
@@ -1422,6 +1433,7 @@ fn masked_headers(headers: &Value) -> String {
         for (name, header) in object {
             if name.contains("signature")
                 || name.contains("authorization")
+                || name.contains("cookie")
                 || name.contains("token")
                 || name.contains("secret")
             {

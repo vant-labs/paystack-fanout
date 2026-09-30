@@ -64,11 +64,13 @@ pub async fn process_one(state: &AppState, delivery: ClaimedDelivery) {
     if !has_content_type {
         request = request.header("content-type", &delivery.content_type);
     }
-    if delivery.headers.as_object().is_none() && !delivery.signature.is_empty() {
-        request = request.header("x-paystack-signature", &delivery.signature);
-    }
+    let fanout_event_id = if delivery.provider_event_id.is_empty() {
+        delivery.event_id.to_string()
+    } else {
+        delivery.provider_event_id.clone()
+    };
     let request = request
-        .header("x-fanout-event-id", delivery.event_id.to_string())
+        .header("x-fanout-event-id", fanout_event_id)
         .header("x-fanout-attempt", delivery.attempt.to_string())
         .body(delivery.raw_body.clone())
         .send()
@@ -133,14 +135,16 @@ pub async fn process_one(state: &AppState, delivery: ClaimedDelivery) {
 }
 
 fn forwardable_header(name: &str) -> bool {
-    !matches!(
+    matches!(
         name.to_ascii_lowercase().as_str(),
-        "host"
-            | "content-length"
-            | "transfer-encoding"
-            | "connection"
-            | "x-fanout-event-id"
-            | "x-fanout-attempt"
+        "content-type"
+            | "authorization"
+            | "x-paystack-signature"
+            | "x-apple-signature"
+            | "x-apple-notification-signature"
+            | "x-apple-connect-signature"
+            | "x-google-signature"
+            | "x-goog-signature"
     )
 }
 

@@ -25,7 +25,7 @@ use crate::{
     config::{Config, ExtendedRouteMatcher, RouteConfig as ConfigRoute},
     db::{Database, DatabaseRoute, DatabaseRouteRecord, DatabaseRouteResponse, InsertResult},
     metrics::Metrics,
-    provider::provider_for,
+    provider::{Provider, provider_for},
     routing::{MatchSource, database_route_records, decide_with_fields, reference},
     security::bearer_matches,
 };
@@ -235,6 +235,10 @@ pub(crate) async fn ingest(
         tracing::error!(source = %source, provider = %source_config.provider, "unsupported source provider");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
+    if !provider.implemented() {
+        tracing::warn!(source = %source, provider = provider.name(), "webhook provider is not implemented");
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     if !allowed_ip(
         source_config.allowed_ips.as_slice(),
         state.trust_proxy,
@@ -244,16 +248,7 @@ pub(crate) async fn ingest(
         tracing::warn!(source = %source, "webhook rejected by IP allowlist");
         return StatusCode::FORBIDDEN.into_response();
     }
-    let signature = [
-        "x-paystack-signature",
-        "x-apple-signature",
-        "x-apple-notification-signature",
-        "x-google-signature",
-        "x-goog-signature",
-        "x-apple-connect-signature",
-    ]
-    .iter()
-    .find_map(|name| headers.get(*name).and_then(|value| value.to_str().ok()));
+    let signature = provider.authenticated_header(&headers);
     let secret = match active_secrets
         .get(&source)
         .cloned()
@@ -321,11 +316,11 @@ pub(crate) async fn ingest(
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json");
-    let stored_headers = headers_to_json(&headers);
-    let dedupe = event_id;
+    let stored_headers = headers_to_json(&headers, provider);
+    let dedupe = provider.dedupe_key(&payload, &body);
     let inserted = match state
         .db
-        .insert_event(
+        .insert_event_with_provider_event_id(
             &source,
             event_type,
             &body,
@@ -333,6 +328,7 @@ pub(crate) async fn ingest(
             signature.unwrap_or_default(),
             &stored_headers,
             &dedupe,
+            &event_id,
             matched_route,
             Some(match decision.source {
                 MatchSource::AppIdentifier => "app_identifier",
@@ -425,33 +421,23 @@ fn allowed_ip(
     ip.is_some_and(|ip| allowed.contains(&ip))
 }
 
-fn headers_to_json(headers: &HeaderMap) -> Value {
+fn headers_to_json(headers: &HeaderMap, provider: &dyn Provider) -> Value {
     let mut object = serde_json::Map::new();
-    for (name, value) in headers {
-        let Ok(value) = value.to_str() else {
-            continue;
-        };
-        let key = name.as_str().to_owned();
-        match object.remove(&key) {
-            None => {
-                object.insert(key, Value::String(value.to_owned()));
-            }
-            Some(Value::String(previous)) => {
-                object.insert(
-                    key,
-                    Value::Array(vec![
-                        Value::String(previous),
-                        Value::String(value.to_owned()),
-                    ]),
-                );
-            }
-            Some(Value::Array(mut values)) => {
-                values.push(Value::String(value.to_owned()));
-                object.insert(key, Value::Array(values));
-            }
-            Some(previous) => {
-                object.insert(key, previous);
-            }
+    let mut names = vec![header::CONTENT_TYPE.as_str()];
+    names.extend(provider.auth_header_names());
+    for name in names {
+        let values = headers
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok().map(str::to_owned))
+            .collect::<Vec<_>>();
+        if values.len() == 1 {
+            object.insert(name.to_owned(), Value::String(values[0].clone()));
+        } else if !values.is_empty() {
+            object.insert(
+                name.to_owned(),
+                Value::Array(values.into_iter().map(Value::String).collect()),
+            );
         }
     }
     Value::Object(object)
@@ -702,6 +688,10 @@ pub(crate) struct RouteWriteBody {
     pub enabled: Option<bool>,
 }
 
+fn valid_environment(environment: Option<&str>) -> bool {
+    environment.is_none_or(|value| matches!(value, "production" | "sandbox"))
+}
+
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub(crate) struct SettingWriteBody {
     pub value: String,
@@ -803,6 +793,7 @@ pub(crate) async fn create_admin_route(
     };
     if name.trim().is_empty()
         || !valid_https_target(target_url)
+        || !valid_environment(body.environment.as_deref())
         || (body.ref_prefix.is_none()
             && body.metadata_app.is_none()
             && body.plan_code_prefix.is_none()
@@ -877,6 +868,13 @@ pub(crate) async fn update_admin_route(
         .is_some_and(|value| !valid_https_target(value))
     {
         return (StatusCode::BAD_REQUEST, "target_url must be https").into_response();
+    }
+    if !valid_environment(body.environment.as_deref()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "environment must be production or sandbox",
+        )
+            .into_response();
     }
     match state
         .db

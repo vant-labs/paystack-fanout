@@ -13,9 +13,7 @@ multi-customer service.
 ```mermaid
 flowchart LR
     P[Paystack] -->|raw POST| I["POST /in/{source}"]
-    AS[Apple notifications] --> I
-    GP[Google Play RTDN] --> I
-    AC[Apple Connect] --> I
+    AS[Reserved store adapters] -.-> I
     I --> V[Provider auth + IP check]
     V --> D[(Postgres events)]
     D --> Q[(Postgres deliveries)]
@@ -33,8 +31,10 @@ transactional persistence, and acknowledgement. Forwarding never runs inline.
 The destination receives the original body and authentication headers,
 unchanged, plus `X-Fanout-Event-Id` and `X-Fanout-Attempt`.
 
-Supported source providers are `paystack`, `apple_server_notifications`,
-`google_play_rtdn`, and `apple_connect_webhooks`.
+The only implemented source provider is `paystack`. The source names
+`apple_server_notifications`, `google_play_rtdn`, and
+`apple_connect_webhooks` are reserved for later provider work; they reject
+requests until their authentication adapters are implemented.
 
 ## Quick start
 

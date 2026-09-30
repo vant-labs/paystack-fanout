@@ -242,7 +242,7 @@ impl Config {
         );
         for source in self.source.values() {
             anyhow::ensure!(
-                crate::provider::supported_providers().contains(&source.provider.as_str()),
+                crate::provider::known_providers().contains(&source.provider.as_str()),
                 "unsupported provider {}",
                 source.provider
             );

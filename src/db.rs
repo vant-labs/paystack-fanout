@@ -26,6 +26,7 @@ pub struct ClaimedDelivery {
     pub raw_body: Vec<u8>,
     pub content_type: String,
     pub signature: String,
+    pub provider_event_id: String,
     pub headers: Value,
     pub destination_url: String,
     pub max_attempts: i32,
@@ -261,13 +262,15 @@ impl Database {
         if route_count == 0 {
             for route in &config.route {
                 let matcher = route.matcher.extended();
-                sqlx::query("INSERT INTO routes (id, name, destination_url, target_url, matcher, ref_prefix, metadata_app, created_at, updated_at) VALUES ($1, $2, $3, $3, $4, $5, $6, now(), now())")
+                sqlx::query("INSERT INTO routes (id, name, destination_url, target_url, matcher, ref_prefix, metadata_app, app_identifier, environment, created_at, updated_at) VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, now(), now())")
                     .bind(Uuid::new_v4())
                     .bind(&route.name)
                     .bind(&route.destination_url)
                     .bind(serde_json::to_value(&matcher)?)
                     .bind(&matcher.reference_prefix)
                     .bind(&matcher.metadata_app)
+                    .bind(&matcher.app_identifier)
+                    .bind(&matcher.environment)
                     .execute(&mut *tx)
                     .await?;
             }
@@ -346,7 +349,7 @@ impl Database {
             }
         }
         let route_rows = sqlx::query(
-            "SELECT name, COALESCE(target_url, destination_url) AS destination_url, matcher, ref_prefix, metadata_app FROM routes WHERE enabled = true ORDER BY name",
+            "SELECT name, COALESCE(target_url, destination_url) AS destination_url, matcher, ref_prefix, metadata_app, app_identifier, environment FROM routes WHERE enabled = true ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await;
@@ -364,6 +367,14 @@ impl Database {
                         row.try_get("ref_prefix").ok().or(matcher.reference_prefix);
                     matcher.metadata_app =
                         row.try_get("metadata_app").ok().or(matcher.metadata_app);
+                    matcher.app_identifier = row
+                        .try_get::<Option<String>, _>("app_identifier")
+                        .ok()
+                        .flatten();
+                    matcher.environment = row
+                        .try_get::<Option<String>, _>("environment")
+                        .ok()
+                        .flatten();
                     Some(RouteConfig {
                         name,
                         destination_url,
@@ -487,7 +498,7 @@ impl Database {
     }
 
     pub async fn list_routes(&self) -> Result<Vec<RouteView>> {
-        let rows = sqlx::query("SELECT name, destination_url, matcher, timeout_seconds, max_attempts, enabled FROM routes ORDER BY name")
+        let rows = sqlx::query("SELECT name, destination_url, matcher, app_identifier, environment, timeout_seconds, max_attempts, enabled FROM routes ORDER BY name")
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter()
@@ -495,6 +506,8 @@ impl Database {
                 let matcher: Value = row.try_get("matcher")?;
                 let matcher: RouteMatcher = serde_json::from_value(matcher).unwrap_or_default();
                 let extended = matcher.extended();
+                let app_identifier: Option<String> = row.try_get("app_identifier")?;
+                let environment: Option<String> = row.try_get("environment")?;
                 let legacy_matcher = RouteMatcher {
                     metadata_app: extended.metadata_app.clone(),
                     plan_code_prefix: extended.plan_code_prefix.clone(),
@@ -503,8 +516,8 @@ impl Database {
                 Ok(RouteView {
                     name: row.try_get("name")?,
                     destination_url: row.try_get("destination_url")?,
-                    app_identifier: extended.app_identifier,
-                    environment: extended.environment,
+                    app_identifier: app_identifier.or(extended.app_identifier),
+                    environment: environment.or(extended.environment),
                     matcher: legacy_matcher,
                     timeout_seconds: row.try_get("timeout_seconds")?,
                     max_attempts: row.try_get("max_attempts")?,
@@ -526,7 +539,7 @@ impl Database {
 
     pub async fn list_database_route_records(&self) -> Result<Vec<DatabaseRouteRecord>> {
         let rows = sqlx::query(
-            "SELECT id, name, COALESCE(target_url, destination_url) AS target_url, ref_prefix, metadata_app, matcher, enabled FROM routes ORDER BY name",
+            "SELECT id, name, COALESCE(target_url, destination_url) AS target_url, ref_prefix, metadata_app, app_identifier, environment, matcher, enabled FROM routes ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -543,6 +556,8 @@ impl Database {
                     .or(matcher.metadata_app.clone());
                 matcher.reference_prefix = ref_prefix.clone();
                 matcher.metadata_app = metadata_app.clone();
+                matcher.app_identifier = row.try_get("app_identifier")?;
+                matcher.environment = row.try_get("environment")?;
                 Ok(DatabaseRouteRecord {
                     route: DatabaseRoute {
                         id: row.try_get("id")?,
@@ -616,7 +631,7 @@ impl Database {
         );
         let id = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO routes (id, name, destination_url, target_url, matcher, ref_prefix, metadata_app, max_attempts, enabled, created_at, updated_at) VALUES ($1, $2, $3, $3, $4, $5, $6, 3, $7, now(), now())",
+            "INSERT INTO routes (id, name, destination_url, target_url, matcher, ref_prefix, metadata_app, app_identifier, environment, max_attempts, enabled, created_at, updated_at) VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, 3, $9, now(), now())",
         )
         .bind(id)
         .bind(name)
@@ -624,6 +639,8 @@ impl Database {
         .bind(serde_json::to_value(matcher)?)
         .bind(&matcher.reference_prefix)
         .bind(&matcher.metadata_app)
+        .bind(&matcher.app_identifier)
+        .bind(&matcher.environment)
         .bind(enabled)
         .execute(&self.pool)
         .await?;
@@ -701,13 +718,15 @@ impl Database {
             "at least one match rule is required"
         );
         sqlx::query(
-            "UPDATE routes SET destination_url = $2, target_url = $2, matcher = $3, ref_prefix = $4, metadata_app = $5, enabled = $6, updated_at = now() WHERE name = $1",
+            "UPDATE routes SET destination_url = $2, target_url = $2, matcher = $3, ref_prefix = $4, metadata_app = $5, app_identifier = $6, environment = $7, enabled = $8, updated_at = now() WHERE name = $1",
         )
         .bind(name)
         .bind(target_url)
         .bind(serde_json::to_value(&matcher)?)
         .bind(matcher.reference_prefix.as_deref())
         .bind(matcher.metadata_app.as_deref())
+        .bind(matcher.app_identifier.as_deref())
+        .bind(matcher.environment.as_deref())
         .bind(enabled)
         .execute(&self.pool)
         .await?;
@@ -897,13 +916,15 @@ impl Database {
         enabled: bool,
     ) -> Result<()> {
         let extended_matcher = matcher.extended();
-        sqlx::query("INSERT INTO routes (id, name, destination_url, target_url, matcher, ref_prefix, metadata_app, timeout_seconds, max_attempts, enabled, created_at, updated_at) VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, $9, now(), now()) ON CONFLICT (name) DO UPDATE SET destination_url = EXCLUDED.destination_url, target_url = EXCLUDED.target_url, matcher = EXCLUDED.matcher, ref_prefix = EXCLUDED.ref_prefix, metadata_app = EXCLUDED.metadata_app, timeout_seconds = EXCLUDED.timeout_seconds, max_attempts = EXCLUDED.max_attempts, enabled = EXCLUDED.enabled, updated_at = now()")
+        sqlx::query("INSERT INTO routes (id, name, destination_url, target_url, matcher, ref_prefix, metadata_app, app_identifier, environment, timeout_seconds, max_attempts, enabled, created_at, updated_at) VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), now()) ON CONFLICT (name) DO UPDATE SET destination_url = EXCLUDED.destination_url, target_url = EXCLUDED.target_url, matcher = EXCLUDED.matcher, ref_prefix = EXCLUDED.ref_prefix, metadata_app = EXCLUDED.metadata_app, app_identifier = EXCLUDED.app_identifier, environment = EXCLUDED.environment, timeout_seconds = EXCLUDED.timeout_seconds, max_attempts = EXCLUDED.max_attempts, enabled = EXCLUDED.enabled, updated_at = now()")
             .bind(Uuid::new_v4())
             .bind(name)
             .bind(destination_url)
             .bind(serde_json::to_value(&extended_matcher)?)
             .bind(&extended_matcher.reference_prefix)
             .bind(&extended_matcher.metadata_app)
+            .bind(&extended_matcher.app_identifier)
+            .bind(&extended_matcher.environment)
             .bind(timeout_seconds)
             .bind(max_attempts)
             .bind(enabled)
@@ -1216,13 +1237,46 @@ impl Database {
         status: &str,
         destination_url: Option<&str>,
     ) -> Result<InsertResult> {
+        self.insert_event_with_provider_event_id(
+            source,
+            event_type,
+            raw_body,
+            content_type,
+            signature,
+            headers,
+            dedupe_key,
+            "",
+            matched_route,
+            routing_reason,
+            status,
+            destination_url,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_event_with_provider_event_id(
+        &self,
+        source: &str,
+        event_type: &str,
+        raw_body: &[u8],
+        content_type: &str,
+        signature: &str,
+        headers: &Value,
+        dedupe_key: &str,
+        provider_event_id: &str,
+        matched_route: Option<&str>,
+        routing_reason: Option<&str>,
+        status: &str,
+        destination_url: Option<&str>,
+    ) -> Result<InsertResult> {
         let event_id = Uuid::new_v4();
         let delivery_id = Uuid::new_v4();
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
         let inserted = sqlx::query(
-            r#"INSERT INTO events (id, source, event_type, raw_body, content_type, signature, headers, dedupe_key, matched_route, routing_reason, status, received_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (source, dedupe_key) DO NOTHING"#,
+            r#"INSERT INTO events (id, source, event_type, raw_body, content_type, signature, headers, dedupe_key, provider_event_id, matched_route, routing_reason, status, received_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) ON CONFLICT (source, dedupe_key) DO NOTHING"#,
         )
         .bind(event_id)
         .bind(source)
@@ -1232,6 +1286,7 @@ impl Database {
         .bind(signature)
         .bind(headers)
         .bind(dedupe_key)
+        .bind(provider_event_id)
         .bind(matched_route)
         .bind(routing_reason)
         .bind(status)
@@ -1293,7 +1348,7 @@ impl Database {
     pub async fn claim_delivery(&self) -> Result<Option<ClaimedDelivery>> {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            r#"SELECT d.id as delivery_id, d.event_id, d.attempts, e.raw_body, e.content_type, e.signature, e.headers, d.destination_url, COALESCE(r.max_attempts, 10) AS max_attempts
+            r#"SELECT d.id as delivery_id, d.event_id, d.attempts, e.raw_body, e.content_type, e.signature, e.provider_event_id, e.headers, d.destination_url, COALESCE(r.max_attempts, 10) AS max_attempts
                FROM deliveries d JOIN events e ON e.id = d.event_id
                LEFT JOIN routes r ON r.id = d.route_id
                WHERE ((d.status IN ('pending', 'retrying') AND d.next_attempt_at <= now())
@@ -1321,6 +1376,7 @@ impl Database {
             raw_body: row.try_get("raw_body")?,
             content_type: row.try_get("content_type")?,
             signature: row.try_get("signature")?,
+            provider_event_id: row.try_get("provider_event_id")?,
             headers: row.try_get("headers")?,
             destination_url: row.try_get("destination_url")?,
             max_attempts: row.try_get("max_attempts")?,

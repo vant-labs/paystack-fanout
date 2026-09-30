@@ -44,11 +44,11 @@ pub fn database_route_records<'a>(
     fields: &RoutingFields,
 ) -> Option<&'a DatabaseRouteRecord> {
     for preferred_source in [
-        MatchSource::AppIdentifier,
-        MatchSource::Environment,
         MatchSource::MetadataApp,
         MatchSource::PlanCode,
         MatchSource::Reference,
+        MatchSource::AppIdentifier,
+        MatchSource::Environment,
     ] {
         if let Some(route) = routes
             .iter()
@@ -102,20 +102,6 @@ pub fn match_source(
         return None;
     }
     if matcher
-        .app_identifier
-        .as_deref()
-        .is_some_and(|value| fields.app_identifier.as_deref() == Some(value))
-    {
-        return Some(MatchSource::AppIdentifier);
-    }
-    if matcher
-        .environment
-        .as_deref()
-        .is_some_and(|value| fields.environment.as_deref() == Some(value))
-    {
-        return Some(MatchSource::Environment);
-    }
-    if matcher
         .metadata_app
         .as_deref()
         .is_some_and(|value| fields.metadata_app.as_deref() == Some(value))
@@ -137,6 +123,20 @@ pub fn match_source(
             .is_some_and(|value| value.starts_with(prefix))
     }) {
         return Some(MatchSource::Reference);
+    }
+    if matcher
+        .app_identifier
+        .as_deref()
+        .is_some_and(|value| fields.app_identifier.as_deref() == Some(value))
+    {
+        return Some(MatchSource::AppIdentifier);
+    }
+    if matcher
+        .environment
+        .as_deref()
+        .is_some_and(|value| fields.environment.as_deref() == Some(value))
+    {
+        return Some(MatchSource::Environment);
     }
     None
 }
@@ -163,11 +163,11 @@ pub fn decide_with_fields(
     fields: &RoutingFields,
 ) -> RouteDecision {
     for preferred_source in [
-        MatchSource::AppIdentifier,
-        MatchSource::Environment,
         MatchSource::MetadataApp,
         MatchSource::PlanCode,
         MatchSource::Reference,
+        MatchSource::AppIdentifier,
+        MatchSource::Environment,
     ] {
         if let Some(route) = config.route.iter().find(|route| {
             match_source(&route.matcher.extended(), fields).as_ref() == Some(&preferred_source)
@@ -359,6 +359,23 @@ mod tests {
             "data": {"bundleId":"com.example.store","environment":"sandbox"}
         });
         assert!(decide(&c, &wrong_environment).route.is_none());
+    }
+
+    #[test]
+    fn legacy_route_precedes_environment_only_route() {
+        let mut c = config();
+        c.route.push(RouteConfig {
+            name: "sandbox-store".into(),
+            destination_url: "http://store".into(),
+            matcher: RouteMatcher::from_extended(ExtendedRouteMatcher {
+                environment: Some("sandbox".into()),
+                ..ExtendedRouteMatcher::default()
+            }),
+        });
+        let payload = serde_json::json!({
+            "data": {"metadata": {"app": "timamu"}, "environment": "sandbox"}
+        });
+        assert_eq!(decide(&c, &payload).route.unwrap().name, "timamu");
     }
 
     #[test]

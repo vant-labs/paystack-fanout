@@ -80,20 +80,92 @@ fn signed(body: &[u8]) -> String {
 
 async fn post_event(state: Arc<AppState>, body: Vec<u8>) -> StatusCode {
     let signature = signed(&body);
+    post_source(state, "paystack_main", body, Some(signature)).await
+}
+
+async fn post_source(
+    state: Arc<AppState>,
+    source: &str,
+    body: Vec<u8>,
+    signature: Option<String>,
+) -> StatusCode {
     let app = build_router(state).layer(Extension(ConnectInfo(std::net::SocketAddr::from((
         [127, 0, 0, 1],
         1234,
     )))));
-    app.oneshot(
-        Request::post("/in/paystack_main")
-            .header("content-type", "application/json")
-            .header("x-paystack-signature", signature)
-            .body(Body::from(body))
-            .unwrap(),
-    )
-    .await
-    .unwrap()
-    .status()
+    let mut request =
+        Request::post(format!("/in/{source}")).header("content-type", "application/json");
+    if let Some(signature) = signature {
+        request = request.header("x-paystack-signature", signature);
+    }
+    app.oneshot(request.body(Body::from(body)).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+#[serial]
+async fn ingest_rejects_bad_and_missing_signature_and_keeps_paystack_dedupe_key() {
+    if !can_run() {
+        return;
+    }
+    let (state, db) = setup("https://example.invalid/destination".into(), None).await;
+    let body = br#"{"event":"charge.success","data":{"reference":"bad_sig"}}"#.to_vec();
+    assert_eq!(
+        post_source(
+            state.clone(),
+            "paystack_main",
+            body.clone(),
+            Some("bad".into())
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        post_source(state.clone(), "paystack_main", body.clone(), None).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(post_event(state, body.clone()).await, StatusCode::OK);
+    let stored: String =
+        sqlx::query_scalar("SELECT dedupe_key FROM events WHERE source = 'paystack_main'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, paystack_fanout::security::dedupe_key(&body));
+}
+
+#[tokio::test]
+#[serial]
+async fn ingest_rejects_unimplemented_provider() {
+    if !can_run() {
+        return;
+    }
+    let db = Database::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    db.migrate().await.unwrap();
+    let config = Config {
+        source: HashMap::from([(
+            "apple_main".to_owned(),
+            SourceConfig {
+                provider: "apple_server_notifications".into(),
+                secret_env: "APPLE_SECRET".into(),
+                allowed_ips: vec![],
+            },
+        )]),
+        route: vec![],
+        fallback: FallbackConfig {
+            mode: "unrouted".into(),
+        },
+        alerts: None,
+        retention_days: 90,
+    };
+    let state = Arc::new(AppState::new(config, db).unwrap());
+    assert_eq!(
+        post_source(state, "apple_main", br#"{}"#.to_vec(), None).await,
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 #[tokio::test]

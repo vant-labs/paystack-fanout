@@ -16,9 +16,23 @@ pub struct RoutingFields {
 /// Provider boundary for authentication and provider-specific event metadata.
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
+    fn implemented(&self) -> bool {
+        true
+    }
     fn authenticate(&self, secret: &[u8], headers: &HeaderMap, raw_body: &[u8]) -> bool;
+    fn auth_header_names(&self) -> &'static [&'static str] {
+        &[]
+    }
+    fn authenticated_header<'a>(&self, headers: &'a HeaderMap) -> Option<&'a str> {
+        self.auth_header_names()
+            .iter()
+            .find_map(|name| headers.get(*name).and_then(|value| value.to_str().ok()))
+    }
     fn event_type<'a>(&self, payload: &'a Value) -> &'a str;
     fn event_id(&self, payload: &Value, raw_body: &[u8]) -> String;
+    fn dedupe_key(&self, payload: &Value, raw_body: &[u8]) -> String {
+        self.event_id(payload, raw_body)
+    }
     fn routing_fields(&self, payload: &Value) -> RoutingFields;
 }
 
@@ -40,6 +54,10 @@ impl Provider for PaystackProvider {
         )
     }
 
+    fn auth_header_names(&self) -> &'static [&'static str] {
+        &["x-paystack-signature"]
+    }
+
     fn event_type<'a>(&self, payload: &'a Value) -> &'a str {
         payload
             .get("event")
@@ -51,128 +69,56 @@ impl Provider for PaystackProvider {
         event_id_from_paths(payload, &["id", "data.id"]).unwrap_or_else(|| dedupe_key(raw_body))
     }
 
+    fn dedupe_key(&self, _payload: &Value, raw_body: &[u8]) -> String {
+        dedupe_key(raw_body)
+    }
+
     fn routing_fields(&self, payload: &Value) -> RoutingFields {
         paystack_fields(payload)
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct AppleServerNotificationsProvider;
-
-impl Provider for AppleServerNotificationsProvider {
-    fn name(&self) -> &'static str {
-        "apple_server_notifications"
-    }
-
-    fn authenticate(&self, secret: &[u8], headers: &HeaderMap, raw_body: &[u8]) -> bool {
-        verify_header_signature(
-            secret,
-            headers,
-            raw_body,
-            &["x-apple-signature", "x-apple-notification-signature"],
-        )
-    }
-
-    fn event_type<'a>(&self, payload: &'a Value) -> &'a str {
-        payload
-            .get("notificationType")
-            .and_then(Value::as_str)
-            .or_else(|| payload.get("eventType").and_then(Value::as_str))
-            .unwrap_or("unknown")
-    }
-
-    fn event_id(&self, payload: &Value, raw_body: &[u8]) -> String {
-        event_id_from_paths(
-            payload,
-            &[
-                "notificationUUID",
-                "notificationId",
-                "data.notificationUUID",
-            ],
-        )
-        .unwrap_or_else(|| dedupe_key(raw_body))
-    }
-
-    fn routing_fields(&self, payload: &Value) -> RoutingFields {
-        store_fields(payload)
-    }
+#[derive(Debug, Clone, Copy)]
+struct UnimplementedProvider {
+    name: &'static str,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct GooglePlayRtdnProvider;
-
-impl Provider for GooglePlayRtdnProvider {
+impl Provider for UnimplementedProvider {
     fn name(&self) -> &'static str {
-        "google_play_rtdn"
+        self.name
     }
 
-    fn authenticate(&self, secret: &[u8], headers: &HeaderMap, raw_body: &[u8]) -> bool {
-        verify_header_signature(
-            secret,
-            headers,
-            raw_body,
-            &["x-google-signature", "x-goog-signature"],
-        )
+    fn implemented(&self) -> bool {
+        false
     }
 
-    fn event_type<'a>(&self, payload: &'a Value) -> &'a str {
-        payload
-            .pointer("/message/attributes/eventType")
-            .and_then(Value::as_str)
-            .or_else(|| payload.get("eventType").and_then(Value::as_str))
-            .unwrap_or("unknown")
+    fn authenticate(&self, _secret: &[u8], _headers: &HeaderMap, _raw_body: &[u8]) -> bool {
+        false
     }
 
-    fn event_id(&self, payload: &Value, raw_body: &[u8]) -> String {
-        event_id_from_paths(payload, &["message.messageId", "eventId", "id"])
-            .unwrap_or_else(|| dedupe_key(raw_body))
+    fn event_type<'a>(&self, _payload: &'a Value) -> &'a str {
+        "unknown"
     }
 
-    fn routing_fields(&self, payload: &Value) -> RoutingFields {
-        store_fields(payload)
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct AppleConnectWebhooksProvider;
-
-impl Provider for AppleConnectWebhooksProvider {
-    fn name(&self) -> &'static str {
-        "apple_connect_webhooks"
+    fn event_id(&self, _payload: &Value, raw_body: &[u8]) -> String {
+        dedupe_key(raw_body)
     }
 
-    fn authenticate(&self, secret: &[u8], headers: &HeaderMap, raw_body: &[u8]) -> bool {
-        verify_header_signature(
-            secret,
-            headers,
-            raw_body,
-            &["x-apple-connect-signature", "x-apple-signature"],
-        )
-    }
-
-    fn event_type<'a>(&self, payload: &'a Value) -> &'a str {
-        payload
-            .get("eventType")
-            .and_then(Value::as_str)
-            .or_else(|| payload.get("type").and_then(Value::as_str))
-            .unwrap_or("unknown")
-    }
-
-    fn event_id(&self, payload: &Value, raw_body: &[u8]) -> String {
-        event_id_from_paths(payload, &["notificationId", "eventId", "id"])
-            .unwrap_or_else(|| dedupe_key(raw_body))
-    }
-
-    fn routing_fields(&self, payload: &Value) -> RoutingFields {
-        store_fields(payload)
+    fn routing_fields(&self, _payload: &Value) -> RoutingFields {
+        RoutingFields::default()
     }
 }
 
 static PAYSTACK: PaystackProvider = PaystackProvider;
-static APPLE_SERVER_NOTIFICATIONS: AppleServerNotificationsProvider =
-    AppleServerNotificationsProvider;
-static GOOGLE_PLAY_RTDN: GooglePlayRtdnProvider = GooglePlayRtdnProvider;
-static APPLE_CONNECT_WEBHOOKS: AppleConnectWebhooksProvider = AppleConnectWebhooksProvider;
+static APPLE_SERVER_NOTIFICATIONS: UnimplementedProvider = UnimplementedProvider {
+    name: "apple_server_notifications",
+};
+static GOOGLE_PLAY_RTDN: UnimplementedProvider = UnimplementedProvider {
+    name: "google_play_rtdn",
+};
+static APPLE_CONNECT_WEBHOOKS: UnimplementedProvider = UnimplementedProvider {
+    name: "apple_connect_webhooks",
+};
 
 pub fn provider_for(name: &str) -> Option<&'static dyn Provider> {
     match name {
@@ -184,7 +130,7 @@ pub fn provider_for(name: &str) -> Option<&'static dyn Provider> {
     }
 }
 
-pub fn supported_providers() -> [&'static str; 4] {
+pub fn known_providers() -> [&'static str; 4] {
     [
         "paystack",
         "apple_server_notifications",
@@ -193,19 +139,8 @@ pub fn supported_providers() -> [&'static str; 4] {
     ]
 }
 
-fn verify_header_signature(
-    secret: &[u8],
-    headers: &HeaderMap,
-    raw_body: &[u8],
-    names: &[&str],
-) -> bool {
-    names.iter().any(|name| {
-        verify_signature(
-            secret,
-            raw_body,
-            headers.get(*name).and_then(|value| value.to_str().ok()),
-        )
-    })
+pub fn supported_providers() -> [&'static str; 1] {
+    ["paystack"]
 }
 
 fn event_id_from_paths(payload: &Value, paths: &[&str]) -> Option<String> {
@@ -366,5 +301,19 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-paystack-signature", signature.parse().unwrap());
         assert!(PaystackProvider.authenticate(b"secret", &headers, body));
+    }
+
+    #[test]
+    fn store_providers_are_explicitly_unimplemented() {
+        for name in [
+            "apple_server_notifications",
+            "google_play_rtdn",
+            "apple_connect_webhooks",
+        ] {
+            let provider = provider_for(name).unwrap();
+            assert!(!provider.implemented());
+            assert!(!provider.authenticate(b"secret", &HeaderMap::new(), b"{}"));
+        }
+        assert_eq!(supported_providers(), ["paystack"]);
     }
 }
