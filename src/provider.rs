@@ -1,11 +1,21 @@
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
+
+use async_trait::async_trait;
 use axum::http::HeaderMap;
 use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use ring::signature::{ECDSA_P256_SHA256_FIXED, UnparsedPublicKey};
+use serde::Deserialize;
 use serde_json::Value;
-use x509_parser::prelude::parse_x509_certificate;
+use tokio::sync::RwLock;
+use x509_parser::{pem::parse_x509_pem, prelude::parse_x509_certificate, public_key::PublicKey};
 
 use crate::security::{dedupe_key, verify_hmac_sha256_signature, verify_signature};
 
@@ -20,6 +30,7 @@ pub struct RoutingFields {
 }
 
 /// Provider boundary for authentication and provider-specific event metadata.
+#[async_trait]
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
     fn implemented(&self) -> bool {
@@ -29,6 +40,15 @@ pub trait Provider: Send + Sync {
         true
     }
     fn authenticate(&self, secret: &[u8], headers: &HeaderMap, raw_body: &[u8]) -> bool;
+    async fn authenticate_with_settings(
+        &self,
+        secret: &[u8],
+        headers: &HeaderMap,
+        raw_body: &[u8],
+        _settings: ProviderSettings<'_>,
+    ) -> bool {
+        self.authenticate(secret, headers, raw_body)
+    }
     fn auth_header_names(&self) -> &'static [&'static str] {
         &[]
     }
@@ -43,6 +63,12 @@ pub trait Provider: Send + Sync {
         self.event_id(payload, raw_body)
     }
     fn routing_fields(&self, payload: &Value) -> RoutingFields;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProviderSettings<'a> {
+    pub audience: Option<&'a str>,
+    pub service_account: Option<&'a str>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -229,6 +255,234 @@ impl Provider for AppStoreConnectWebhooksProvider {
     }
 }
 
+pub struct GooglePlayRtdnProvider {
+    keys: RwLock<HashMap<String, DecodingKey>>,
+    refreshed_at: Mutex<Option<Instant>>,
+    client: reqwest::Client,
+    key_url: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct GooglePushClaims {
+    email: String,
+    email_verified: bool,
+}
+
+impl GooglePlayRtdnProvider {
+    const KEY_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+    const KEY_URL: &'static str = "https://www.googleapis.com/oauth2/v1/certs";
+
+    pub fn new() -> Self {
+        Self {
+            keys: RwLock::new(HashMap::new()),
+            refreshed_at: Mutex::new(None),
+            client: reqwest::Client::new(),
+            key_url: Self::KEY_URL,
+        }
+    }
+
+    async fn key_for(&self, kid: &str) -> Option<DecodingKey> {
+        let cached_key = self.keys.read().await.get(kid).cloned();
+        let cache_fresh = self
+            .refreshed_at
+            .lock()
+            .ok()
+            .and_then(|value| *value)
+            .is_some_and(|value| value.elapsed() < Self::KEY_CACHE_TTL);
+        if cache_fresh && cached_key.is_some() {
+            return cached_key;
+        }
+        self.refresh_keys().await;
+        self.keys.read().await.get(kid).cloned()
+    }
+
+    async fn refresh_keys(&self) {
+        let Ok(response) = self.client.get(self.key_url).send().await else {
+            return;
+        };
+        if !response.status().is_success() {
+            return;
+        }
+        let Ok(certificates) = response.json::<HashMap<String, String>>().await else {
+            return;
+        };
+        let keys = certificates
+            .into_iter()
+            .filter_map(|(kid, certificate)| {
+                rsa_decoding_key(certificate.as_bytes()).map(|key| (kid, key))
+            })
+            .collect::<HashMap<_, _>>();
+        if keys.is_empty() {
+            return;
+        }
+        *self.keys.write().await = keys;
+        if let Ok(mut refreshed_at) = self.refreshed_at.lock() {
+            *refreshed_at = Some(Instant::now());
+        }
+    }
+
+    #[cfg(test)]
+    fn with_keys(keys: HashMap<String, DecodingKey>) -> Self {
+        Self {
+            keys: RwLock::new(keys),
+            refreshed_at: Mutex::new(Some(Instant::now())),
+            client: reqwest::Client::new(),
+            key_url: Self::KEY_URL,
+        }
+    }
+}
+
+impl Default for GooglePlayRtdnProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Provider for GooglePlayRtdnProvider {
+    fn name(&self) -> &'static str {
+        "google_play_rtdn"
+    }
+
+    fn secret_required(&self) -> bool {
+        false
+    }
+
+    fn authenticate(&self, _secret: &[u8], _headers: &HeaderMap, _raw_body: &[u8]) -> bool {
+        false
+    }
+
+    async fn authenticate_with_settings(
+        &self,
+        _secret: &[u8],
+        headers: &HeaderMap,
+        _raw_body: &[u8],
+        settings: ProviderSettings<'_>,
+    ) -> bool {
+        let Some(audience) = settings.audience.filter(|value| !value.is_empty()) else {
+            return false;
+        };
+        let Some(service_account) = settings.service_account.filter(|value| !value.is_empty())
+        else {
+            return false;
+        };
+        let Some(token) = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .filter(|value| !value.is_empty())
+        else {
+            return false;
+        };
+        let Ok(header) = decode_header(token) else {
+            return false;
+        };
+        if header.alg != Algorithm::RS256 {
+            return false;
+        }
+        let Some(kid) = header.kid.as_deref() else {
+            return false;
+        };
+        let Some(key) = self.key_for(kid).await else {
+            return false;
+        };
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_audience(&[audience]);
+        validation.set_issuer(&["accounts.google.com", "https://accounts.google.com"]);
+        let Ok(token_data) = decode::<GooglePushClaims>(token, &key, &validation) else {
+            return false;
+        };
+        token_data.claims.email_verified && token_data.claims.email == service_account
+    }
+
+    fn auth_header_names(&self) -> &'static [&'static str] {
+        &["authorization"]
+    }
+
+    fn event_type(&self, payload: &Value) -> String {
+        let Some(notification) = decoded_google_notification(payload) else {
+            return "unknown".to_owned();
+        };
+        for (key, prefix) in [
+            ("subscriptionNotification", "subscription"),
+            ("oneTimeProductNotification", "one_time_product"),
+        ] {
+            if let Some(notification_type) = notification
+                .get(key)
+                .and_then(|value| value.get("notificationType"))
+                .and_then(Value::as_u64)
+            {
+                return format!("{prefix}:{notification_type}");
+            }
+        }
+        if notification.get("voidedPurchaseNotification").is_some() {
+            return "voided_purchase".to_owned();
+        }
+        if notification
+            .get("pendingPurchaseCancellationNotification")
+            .is_some()
+        {
+            return "pending_refund_review".to_owned();
+        }
+        if notification.get("testNotification").is_some() {
+            return "test".to_owned();
+        }
+        "unknown".to_owned()
+    }
+
+    fn event_id(&self, payload: &Value, raw_body: &[u8]) -> String {
+        payload
+            .pointer("/message/messageId")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                payload
+                    .pointer("/message/message_id")
+                    .and_then(Value::as_str)
+            })
+            .map(str::to_owned)
+            .unwrap_or_else(|| dedupe_key(raw_body))
+    }
+
+    fn dedupe_key(&self, payload: &Value, raw_body: &[u8]) -> String {
+        self.event_id(payload, raw_body)
+    }
+
+    fn routing_fields(&self, payload: &Value) -> RoutingFields {
+        decoded_google_notification(payload)
+            .and_then(|notification| {
+                notification
+                    .get("packageName")
+                    .and_then(Value::as_str)
+                    .map(|package| RoutingFields {
+                        app_identifier: Some(package.to_owned()),
+                        ..RoutingFields::default()
+                    })
+            })
+            .unwrap_or_default()
+    }
+}
+
+fn rsa_decoding_key(certificate: &[u8]) -> Option<DecodingKey> {
+    let (_, pem) = parse_x509_pem(certificate).ok()?;
+    let (_, certificate) = parse_x509_certificate(&pem.contents).ok()?;
+    match certificate.public_key().parsed().ok()? {
+        PublicKey::RSA(key) => Some(
+            DecodingKey::from_rsa_components(
+                &URL_SAFE_NO_PAD.encode(key.modulus),
+                &URL_SAFE_NO_PAD.encode(key.exponent),
+            )
+            .ok()?,
+        ),
+        _ => None,
+    }
+}
+
+fn decoded_google_notification(payload: &Value) -> Option<Value> {
+    let encoded = payload.pointer("/message/data")?.as_str()?;
+    let decoded = STANDARD.decode(encoded).ok()?;
+    serde_json::from_slice(&decoded).ok()
+}
+
 #[derive(Debug, Clone, Copy)]
 struct UnimplementedProvider {
     name: &'static str,
@@ -266,15 +520,13 @@ static APPLE_SERVER_NOTIFICATIONS: AppleServerNotificationsProvider =
         "certs/apple/AppleRootCA-G3.cer"
     ));
 static APPLE_CONNECT_WEBHOOKS: AppStoreConnectWebhooksProvider = AppStoreConnectWebhooksProvider;
-static GOOGLE_PLAY_RTDN: UnimplementedProvider = UnimplementedProvider {
-    name: "google_play_rtdn",
-};
+static GOOGLE_PLAY_RTDN: OnceLock<GooglePlayRtdnProvider> = OnceLock::new();
 
 pub fn provider_for(name: &str) -> Option<&'static dyn Provider> {
     match name {
         "paystack" => Some(&PAYSTACK),
         "apple_server_notifications" => Some(&APPLE_SERVER_NOTIFICATIONS),
-        "google_play_rtdn" => Some(&GOOGLE_PLAY_RTDN),
+        "google_play_rtdn" => Some(GOOGLE_PLAY_RTDN.get_or_init(GooglePlayRtdnProvider::new)),
         "apple_connect_webhooks" => Some(&APPLE_CONNECT_WEBHOOKS),
         _ => None,
     }
@@ -289,11 +541,12 @@ pub fn known_providers() -> [&'static str; 4] {
     ]
 }
 
-pub fn supported_providers() -> [&'static str; 3] {
+pub fn supported_providers() -> [&'static str; 4] {
     [
         "paystack",
         "apple_server_notifications",
         "apple_connect_webhooks",
+        "google_play_rtdn",
     ]
 }
 
@@ -497,6 +750,12 @@ mod tests {
         rand::SystemRandom,
         signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair},
     };
+    use rsa::{
+        RsaPrivateKey,
+        pkcs1::EncodeRsaPrivateKey,
+        rand_core::OsRng,
+        traits::PublicKeyParts,
+    };
     use sha2::Sha512;
     use time::{Duration, OffsetDateTime};
 
@@ -567,15 +826,15 @@ mod tests {
         assert!(apple.implemented());
         let app_store_connect = provider_for("apple_connect_webhooks").unwrap();
         assert!(app_store_connect.implemented());
-        let provider = provider_for("google_play_rtdn").unwrap();
-        assert!(!provider.implemented());
-        assert!(!provider.authenticate(b"secret", &HeaderMap::new(), b"{}"));
+        let google = provider_for("google_play_rtdn").unwrap();
+        assert!(google.implemented());
         assert_eq!(
             supported_providers(),
             [
                 "paystack",
                 "apple_server_notifications",
-                "apple_connect_webhooks"
+                "apple_connect_webhooks",
+                "google_play_rtdn"
             ]
         );
     }
@@ -608,6 +867,163 @@ mod tests {
         let mut tampered = body.clone();
         tampered[0] = b' ';
         assert!(!provider.authenticate(secret, &headers, &tampered));
+    }
+
+    fn google_test_provider() -> (GooglePlayRtdnProvider, RsaPrivateKey) {
+        let private_key = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
+        let decoding_key = DecodingKey::from_rsa_components(
+            &URL_SAFE_NO_PAD.encode(private_key.n().to_bytes_be()),
+            &URL_SAFE_NO_PAD.encode(private_key.e().to_bytes_be()),
+        )
+        .unwrap();
+        (
+            GooglePlayRtdnProvider::with_keys(HashMap::from([(
+                "test-key".to_owned(),
+                decoding_key,
+            )])),
+            private_key,
+        )
+    }
+
+    fn google_test_token(
+        private_key: &RsaPrivateKey,
+        audience: &str,
+        service_account: &str,
+        expiration: i64,
+    ) -> String {
+        let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+        header.kid = Some("test-key".to_owned());
+        let claims = serde_json::json!({
+            "aud": audience,
+            "email": service_account,
+            "email_verified": true,
+            "exp": expiration,
+            "iss": "https://accounts.google.com"
+        });
+        let private_der = private_key.to_pkcs1_der().unwrap();
+        jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_rsa_der(private_der.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn google_play_rtdn_authenticates_google_push_jwt_claims() {
+        let (provider, private_key) = google_test_provider();
+        let audience = "https://example.test/in/google_main";
+        let service_account = "pubsub@example.iam.gserviceaccount.com";
+        let token = google_test_token(
+            &private_key,
+            audience,
+            service_account,
+            chrono::Utc::now().timestamp() + 3600,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        assert!(
+            provider
+                .authenticate_with_settings(
+                    &[],
+                    &headers,
+                    b"{}",
+                    ProviderSettings {
+                        audience: Some(audience),
+                        service_account: Some(service_account),
+                    },
+                )
+                .await
+        );
+        assert!(
+            !provider
+                .authenticate_with_settings(
+                    &[],
+                    &headers,
+                    b"{}",
+                    ProviderSettings {
+                        audience: Some("https://example.test/wrong"),
+                        service_account: Some(service_account),
+                    },
+                )
+                .await
+        );
+        assert!(
+            !provider
+                .authenticate_with_settings(
+                    &[],
+                    &headers,
+                    b"{}",
+                    ProviderSettings {
+                        audience: Some(audience),
+                        service_account: Some("other@example.iam.gserviceaccount.com"),
+                    },
+                )
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn google_play_rtdn_rejects_expired_and_unsigned_tokens() {
+        let (provider, private_key) = google_test_provider();
+        let audience = "https://example.test/in/google_main";
+        let service_account = "pubsub@example.iam.gserviceaccount.com";
+        let expired = google_test_token(&private_key, audience, service_account, 1);
+        let unsigned = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJhdWQiOiJodHRwczovL2V4YW1wbGUudGVzdC9pbi9nb29nbGVfbWFpbiJ9.".to_owned();
+        for token in [expired, unsigned] {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+            assert!(
+                !provider
+                    .authenticate_with_settings(
+                        &[],
+                        &headers,
+                        b"{}",
+                        ProviderSettings {
+                            audience: Some(audience),
+                            service_account: Some(service_account),
+                        },
+                    )
+                    .await
+            );
+        }
+    }
+
+    #[test]
+    fn google_play_rtdn_decodes_pubsub_data_and_message_id() {
+        let provider = GooglePlayRtdnProvider::new();
+        let payload: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/google_play_rtdn.json")).unwrap();
+        assert_eq!(provider.event_type(&payload), "subscription:4");
+        assert_eq!(provider.event_id(&payload, b"body"), "google-message-1");
+        assert_eq!(provider.dedupe_key(&payload, b"body"), "google-message-1");
+        assert_eq!(
+            provider.routing_fields(&payload).app_identifier.as_deref(),
+            Some("com.example.app")
+        );
+
+        for (notification, event_type) in [
+            (
+                serde_json::json!({"voidedPurchaseNotification": {"orderId": "order-1"}}),
+                "voided_purchase",
+            ),
+            (
+                serde_json::json!({"pendingPurchaseCancellationNotification": {"productId": "product-1"}}),
+                "pending_refund_review",
+            ),
+            (
+                serde_json::json!({"testNotification": {"version": "1.0"}}),
+                "test",
+            ),
+        ] {
+            let payload = serde_json::json!({
+                "message": {
+                    "data": STANDARD.encode(serde_json::to_vec(&notification).unwrap()),
+                    "messageId": "google-message-2"
+                }
+            });
+            assert_eq!(provider.event_type(&payload), event_type);
+        }
     }
 
     struct SignedNotification {

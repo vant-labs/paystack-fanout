@@ -67,3 +67,19 @@ fn app_store_connect_fixtures_cover_each_requested_event_family() {
         );
     }
 }
+
+#[test]
+fn google_play_rtdn_fixture_contains_pubsub_envelope() {
+    let body = std::fs::read_to_string("tests/fixtures/google_play_rtdn.json").unwrap();
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        value
+            .pointer("/message/messageId")
+            .and_then(|value| value.as_str()),
+        Some("google-message-1")
+    );
+    assert!(value
+        .pointer("/message/data")
+        .and_then(|value| value.as_str())
+        .is_some());
+}

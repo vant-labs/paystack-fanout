@@ -33,6 +33,8 @@ async fn setup() -> (Arc<AppState>, Database) {
                 provider: "paystack".to_owned(),
                 secret_env: "PAYSTACK_SECRET_KEY".to_owned(),
                 allowed_ips: vec![],
+                audience: None,
+                service_account: None,
             },
         )]),
         route: vec![],

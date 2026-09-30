@@ -1,0 +1,8 @@
+{
+  "message": {
+    "data": "eyJ2ZXJzaW9uIjoiMS4wIiwicGFja2FnZU5hbWUiOiJjb20uZXhhbXBsZS5hcHAiLCJzdWJzY3JpcHRpb25Ob3RpZmljYXRpb24iOnsibm90aWZpY2F0aW9uVHlwZSI6NH19",
+    "messageId": "google-message-1",
+    "publishTime": "2026-09-30T00:00:00Z"
+  },
+  "subscription": "projects/example/subscriptions/fanout"
+}

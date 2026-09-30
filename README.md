@@ -14,7 +14,7 @@ multi-customer service.
 flowchart LR
     P[Paystack] -->|raw POST| I["POST /in/{source}"]
     AS[Apple Server Notifications V2] --> I
-    GP[Reserved Google RTDN adapter] -.-> I
+    GP[Google Play RTDN] --> I
     AC[App Store Connect webhooks] --> I
     I --> V[Provider auth + IP check]
     V --> D[(Postgres events)]
@@ -34,9 +34,8 @@ The destination receives the original body and authentication headers,
 unchanged, plus `X-Fanout-Event-Id` and `X-Fanout-Attempt`.
 
 The implemented source providers are `paystack`,
-`apple_server_notifications`, and `apple_connect_webhooks`. The source name
-`google_play_rtdn` remains reserved for later provider work and rejects
-requests until its authentication adapter is implemented.
+`apple_server_notifications`, `apple_connect_webhooks`, and
+`google_play_rtdn`.
 
 ## Quick start
 
@@ -140,6 +139,32 @@ set the fallback to `route:<name>` for a whole-account destination. Keep these
 routes separate from payment routes.
 
 Apple's current setup and signing details are documented in [Manage webhooks](https://developer.apple.com/help/app-store-connect/manage-your-team/manage-webhooks), [Configuring and parsing webhook notifications](https://developer.apple.com/documentation/appstoreconnectapi/configuring-webhook-notifications), and [WebhookEventType](https://developer.apple.com/documentation/appstoreconnectapi/webhookeventtype).
+
+### Google Play Real-time developer notifications
+
+Configure a Google Play Real-time developer notifications source with provider
+`google_play_rtdn`. Google Play publishes an RTDN message to a Google Cloud
+Pub/Sub topic. Create a wrapped push subscription for the source URL
+`https://your-host/in/google_main`, enable authenticated push delivery, and
+set the configured audience to that exact URL. Set `service_account` to the
+email address of the service account that Pub/Sub uses to sign push requests.
+
+Grant the Google Play service account permission to publish to the topic, then
+configure the topic in Play Console under Monetize with Google Play →
+Monetization setup → Real-time developer notifications. The adapter validates
+the Pub/Sub Bearer JWT, refreshes Google's published signing certificates, and
+requires the configured audience, service-account email, issuer, and verified
+email claim.
+
+RTDN messages are wrapped Pub/Sub envelopes. The adapter decodes
+`message.data`, routes on the notification's `packageName`, and uses the
+Pub/Sub `messageId` as the durable deduplication key. RTDN reports a state
+change rather than the complete purchase state, so the product should query
+the Google Play Developer API after receiving a notification. See Google's
+[RTDN reference](https://developer.android.com/google/play/billing/rtdn-reference),
+[Pub/Sub push delivery](https://cloud.google.com/pubsub/docs/push), and
+[authenticated push subscriptions](https://cloud.google.com/pubsub/docs/authenticate-push-subscriptions)
+for the provider-side setup and payload contract.
 
 An alert destination may be enabled with:
 
