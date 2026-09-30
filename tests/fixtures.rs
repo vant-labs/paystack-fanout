@@ -78,8 +78,10 @@ fn google_play_rtdn_fixture_contains_pubsub_envelope() {
             .and_then(|value| value.as_str()),
         Some("google-message-1")
     );
-    assert!(value
-        .pointer("/message/data")
-        .and_then(|value| value.as_str())
-        .is_some());
+    assert!(
+        value
+            .pointer("/message/data")
+            .and_then(|value| value.as_str())
+            .is_some()
+    );
 }

@@ -483,37 +483,6 @@ fn decoded_google_notification(payload: &Value) -> Option<Value> {
     serde_json::from_slice(&decoded).ok()
 }
 
-#[derive(Debug, Clone, Copy)]
-struct UnimplementedProvider {
-    name: &'static str,
-}
-
-impl Provider for UnimplementedProvider {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    fn implemented(&self) -> bool {
-        false
-    }
-
-    fn authenticate(&self, _secret: &[u8], _headers: &HeaderMap, _raw_body: &[u8]) -> bool {
-        false
-    }
-
-    fn event_type(&self, _payload: &Value) -> String {
-        "unknown".to_owned()
-    }
-
-    fn event_id(&self, _payload: &Value, raw_body: &[u8]) -> String {
-        dedupe_key(raw_body)
-    }
-
-    fn routing_fields(&self, _payload: &Value) -> RoutingFields {
-        RoutingFields::default()
-    }
-}
-
 static PAYSTACK: PaystackProvider = PaystackProvider;
 static APPLE_SERVER_NOTIFICATIONS: AppleServerNotificationsProvider =
     AppleServerNotificationsProvider::with_trusted_root(include_bytes!(
@@ -751,10 +720,7 @@ mod tests {
         signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair},
     };
     use rsa::{
-        RsaPrivateKey,
-        pkcs1::EncodeRsaPrivateKey,
-        rand_core::OsRng,
-        traits::PublicKeyParts,
+        RsaPrivateKey, pkcs1::EncodeRsaPrivateKey, rand_core::OsRng, traits::PublicKeyParts,
     };
     use sha2::Sha512;
     use time::{Duration, OffsetDateTime};
@@ -821,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn store_providers_are_explicitly_unimplemented() {
+    fn store_providers_are_implemented() {
         let apple = provider_for("apple_server_notifications").unwrap();
         assert!(apple.implemented());
         let app_store_connect = provider_for("apple_connect_webhooks").unwrap();
