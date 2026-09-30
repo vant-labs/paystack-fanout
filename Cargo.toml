@@ -28,6 +28,7 @@ hyper = "1"
 ipnet = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rand = "0.9"
+ring = "0.17"
 rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -44,11 +45,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 utoipa = { version = "5", features = ["uuid", "chrono"] }
 utoipa-swagger-ui = { version = "9", features = ["axum"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+x509-parser = { version = "0.18", features = ["verify"] }
 
 [dev-dependencies]
 tempfile = "3"
 tower = "0.5"
 wiremock = "0.6"
+rcgen = "0.14"
+time = "0.3"
 
 [lints.rust]
 unsafe_code = "forbid"

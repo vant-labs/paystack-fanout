@@ -249,16 +249,20 @@ pub(crate) async fn ingest(
         return StatusCode::FORBIDDEN.into_response();
     }
     let signature = provider.authenticated_header(&headers);
-    let secret = match active_secrets
-        .get(&source)
-        .cloned()
-        .or_else(|| active_config.secret_for(&source).ok())
-    {
-        Some(secret) => secret,
-        None => {
-            tracing::error!(source = %source, "source secret unavailable");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    let secret = if provider.secret_required() {
+        match active_secrets
+            .get(&source)
+            .cloned()
+            .or_else(|| active_config.secret_for(&source).ok())
+        {
+            Some(secret) => secret,
+            None => {
+                tracing::error!(source = %source, "source secret unavailable");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
         }
+    } else {
+        String::new()
     };
     if !provider.authenticate(secret.as_bytes(), &headers, &body) {
         state
@@ -322,7 +326,7 @@ pub(crate) async fn ingest(
         .db
         .insert_event_with_provider_event_id(
             &source,
-            event_type,
+            &event_type,
             &body,
             content_type,
             signature.unwrap_or_default(),
@@ -364,7 +368,7 @@ pub(crate) async fn ingest(
                 .db
                 .annotate_delivery(
                     event_id,
-                    event_type,
+                    &event_type,
                     reference(payload.get("data").unwrap_or(&payload)).as_deref(),
                     database_route_id,
                     matched_route.is_some(),
@@ -479,7 +483,9 @@ pub(crate) async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoRespo
         .source
         .iter()
         .filter(|(name, source)| {
-            !secrets.contains_key(*name) && std::env::var(&source.secret_env).is_err()
+            provider_for(&source.provider).is_none_or(Provider::secret_required)
+                && !secrets.contains_key(*name)
+                && std::env::var(&source.secret_env).is_err()
         })
         .map(|(_, source)| source.secret_env.clone())
         .collect::<Vec<_>>();
