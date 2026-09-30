@@ -626,7 +626,8 @@ async fn event_detail(
         .ok()
         .and_then(|value| serde_json::to_string_pretty(&value).ok())
         .unwrap_or_else(|| detail.raw_body.clone());
-    let headers_json = masked_headers(&detail.headers);
+    let headers_json =
+        serde_json::to_string_pretty(&detail.headers).unwrap_or_else(|_| "{}".to_owned());
     render(EventDetailPage {
         user,
         csrf: current_csrf(&state, &headers).await.unwrap_or_default(),
@@ -1425,35 +1426,6 @@ fn login_failed(state: &AppState, key: &str) {
         .entry(key.to_owned())
         .or_insert((0, std::time::Instant::now()));
     entry.0 = entry.0.saturating_add(1);
-}
-
-fn masked_headers(headers: &Value) -> String {
-    let mut value = headers.clone();
-    if let Some(object) = value.as_object_mut() {
-        for (name, header) in object {
-            if name.contains("signature")
-                || name.contains("authorization")
-                || name.contains("cookie")
-                || name.contains("token")
-                || name.contains("secret")
-            {
-                if let Some(text) = header.as_str() {
-                    *header =
-                        Value::String(format!("{}…", text.chars().take(8).collect::<String>()));
-                } else if let Some(values) = header.as_array_mut() {
-                    for value in values {
-                        if let Some(text) = value.as_str() {
-                            *value = Value::String(format!(
-                                "{}…",
-                                text.chars().take(8).collect::<String>()
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_owned())
 }
 
 fn render<T: Template>(template: T) -> Response {

@@ -11,6 +11,7 @@ use paystack_fanout::{
     config::{Config, FallbackConfig, RouteConfig, RouteMatcher, SourceConfig},
     db::{Database, HealthWindow},
 };
+use serde_json::Value;
 use serial_test::serial;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -291,6 +292,68 @@ async fn matcher_and_csv_export_are_available_to_signed_in_users() {
         body.windows(b"charge.success".len())
             .any(|window| window == b"charge.success")
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn admin_event_api_masks_sensitive_headers() {
+    if !can_run() {
+        return;
+    }
+    let (state, db) = setup().await;
+    db.create_owner(
+        "owner@example.com",
+        &hash_password("long secure password").unwrap(),
+    )
+    .await
+    .unwrap();
+    db.insert_event(
+        "paystack_main",
+        "charge.success",
+        br#"{"event":"charge.success"}"#,
+        "application/json",
+        "full-signature",
+        &serde_json::json!({
+            "content-type": "application/json",
+            "x-paystack-signature": "full-signature",
+            "authorization": "Bearer full-token",
+            "cookie": "session=full-cookie",
+            "x-api-token": "full-api-token",
+            "x-client": "safe-value"
+        }),
+        "admin-api-mask-key",
+        Some("test"),
+        Some("metadata.app"),
+        "pending",
+        Some("http://localhost/test"),
+    )
+    .await
+    .unwrap();
+    let event_id = db
+        .list_events(None, None, None, None, 10, 0)
+        .await
+        .unwrap()
+        .first()
+        .unwrap()
+        .id;
+    let (cookie, _) = login(state.clone(), "owner@example.com", "long secure password").await;
+    let response = request(
+        state,
+        "GET",
+        &format!("/admin/events/{event_id}"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let headers = body.get("headers").unwrap();
+    assert_eq!(headers["x-paystack-signature"], "full-sig…");
+    assert_eq!(headers["authorization"], "Bearer f…");
+    assert_eq!(headers["cookie"], "session=…");
+    assert_eq!(headers["x-api-token"], "full-api…");
+    assert_eq!(headers["x-client"], "safe-value");
 }
 
 #[tokio::test]

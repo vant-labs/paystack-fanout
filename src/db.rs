@@ -63,6 +63,38 @@ pub struct EventDetail {
     pub attempts: Vec<AttemptView>,
 }
 
+pub fn mask_sensitive_headers(headers: &Value) -> Value {
+    let mut masked = headers.clone();
+    if let Some(object) = masked.as_object_mut() {
+        for (name, header) in object {
+            let name = name.to_ascii_lowercase();
+            if !(name.contains("authorization")
+                || name.contains("cookie")
+                || name.contains("token")
+                || name.contains("secret")
+                || name.contains("signature"))
+            {
+                continue;
+            }
+            match header {
+                Value::String(value) => {
+                    *header =
+                        Value::String(format!("{}…", value.chars().take(8).collect::<String>()));
+                }
+                Value::Array(values) => {
+                    for value in values {
+                        if let Value::String(value) = value {
+                            *value = format!("{}…", value.chars().take(8).collect::<String>());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    masked
+}
+
 #[derive(Debug)]
 pub struct UserRecord {
     pub id: Uuid,
@@ -1501,7 +1533,7 @@ impl Database {
             delivered_at: row.try_get("delivered_at")?,
         };
         let raw_body: Vec<u8> = row.try_get("raw_body")?;
-        let headers: Value = row.try_get("headers")?;
+        let headers = mask_sensitive_headers(&row.try_get::<Value, _>("headers")?);
         let routing_reason: Option<String> = row.try_get("routing_reason")?;
         let rows = sqlx::query("SELECT da.attempt, da.started_at, da.finished_at, da.status_code, da.latency_ms, da.response_body, da.error FROM delivery_attempts da JOIN deliveries d ON d.id = da.delivery_id WHERE d.event_id = $1 ORDER BY da.attempt").bind(event_id).fetch_all(&self.pool).await?;
         let attempts = rows
