@@ -50,6 +50,8 @@ async fn setup(destination: String, alert_url: Option<String>) -> (Arc<AppState>
                 provider: "paystack".into(),
                 secret_env: "PAYSTACK_SECRET_KEY".into(),
                 allowed_ips: vec![],
+                audience: None,
+                service_account: None,
             },
         )]),
         route: vec![RouteConfig {
@@ -176,6 +178,8 @@ async fn app_store_connect_rejects_tampered_and_wrong_secret_requests_with_401()
                 provider: "apple_connect_webhooks".into(),
                 secret_env: "PAYSTACK_SECRET_KEY".into(),
                 allowed_ips: vec![],
+                audience: None,
+                service_account: None,
             },
         )]),
         route: vec![],
@@ -231,14 +235,7 @@ async fn app_store_connect_rejects_tampered_and_wrong_secret_requests_with_401()
 
 #[tokio::test]
 #[serial]
-async fn ingest_rejects_unimplemented_provider() {
-    if !can_run() {
-        return;
-    }
-    let db = Database::connect(&std::env::var("DATABASE_URL").unwrap())
-        .await
-        .unwrap();
-    db.migrate().await.unwrap();
+async fn google_push_rejects_bad_token_with_401() {
     let config = Config {
         source: HashMap::from([(
             "google_main".to_owned(),
@@ -246,6 +243,8 @@ async fn ingest_rejects_unimplemented_provider() {
                 provider: "google_play_rtdn".into(),
                 secret_env: "GOOGLE_SECRET".into(),
                 allowed_ips: vec![],
+                audience: Some("https://example.test/in/google_main".into()),
+                service_account: Some("pubsub@example.iam.gserviceaccount.com".into()),
             },
         )]),
         route: vec![],
@@ -255,9 +254,17 @@ async fn ingest_rejects_unimplemented_provider() {
         alerts: None,
         retention_days: 90,
     };
-    let state = Arc::new(AppState::new(config, db).unwrap());
+    let pool = sqlx::PgPool::connect_lazy("postgres://localhost/paystack_fanout").unwrap();
+    let state = Arc::new(AppState::new(config, Database { pool }).unwrap());
     assert_eq!(
-        post_source(state, "google_main", br#"{}"#.to_vec(), None).await,
+        post_source_with_header(
+            state,
+            "google_main",
+            br#"{}"#.to_vec(),
+            "authorization",
+            Some("Bearer not-a-jwt".into()),
+        )
+        .await,
         StatusCode::UNAUTHORIZED
     );
 }

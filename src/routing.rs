@@ -278,6 +278,8 @@ mod tests {
                     provider: "paystack".into(),
                     secret_env: "SECRET".into(),
                     allowed_ips: vec![],
+                    audience: None,
+                    service_account: None,
                 },
             )]),
             route: vec![

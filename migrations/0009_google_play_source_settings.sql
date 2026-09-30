@@ -1,0 +1,2 @@
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS audience TEXT;
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS service_account TEXT;

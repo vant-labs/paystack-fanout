@@ -250,6 +250,8 @@ struct SourceForm {
     provider: String,
     secret: Option<String>,
     allowed_ips: Option<String>,
+    audience: Option<String>,
+    service_account: Option<String>,
     enabled: Option<String>,
 }
 
@@ -1283,6 +1285,17 @@ async fn save_source(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let audience = clean_option(form.audience);
+    let service_account = clean_option(form.service_account);
+    if form.provider.trim() == "google_play_rtdn"
+        && (audience.is_none() || service_account.is_none())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Google Play sources require an audience and service account",
+        )
+            .into_response();
+    }
     match state
         .db
         .save_source(
@@ -1290,6 +1303,8 @@ async fn save_source(
             form.provider.trim(),
             secret,
             &allowed_ips,
+            audience.as_deref(),
+            service_account.as_deref(),
             form.enabled.is_some(),
         )
         .await

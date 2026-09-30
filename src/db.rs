@@ -157,6 +157,8 @@ pub struct SourceView {
     pub name: String,
     pub provider: String,
     pub allowed_ips: Vec<String>,
+    pub audience: Option<String>,
+    pub service_account: Option<String>,
     pub enabled: bool,
     pub secret_present: bool,
 }
@@ -281,12 +283,14 @@ impl Database {
         if source_count == 0 {
             for (name, source) in &config.source {
                 let secret = std::env::var(&source.secret_env).ok();
-                sqlx::query("INSERT INTO sources (id, name, provider, secret_ciphertext, allowed_ips, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, now(), now())")
+                sqlx::query("INSERT INTO sources (id, name, provider, secret_ciphertext, allowed_ips, audience, service_account, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now())")
                     .bind(Uuid::new_v4())
                     .bind(name)
                     .bind(&source.provider)
                     .bind(secret.map(|value| encrypt(&value)).transpose()?.unwrap_or_default())
                     .bind(serde_json::to_value(&source.allowed_ips)?)
+                    .bind(&source.audience)
+                    .bind(&source.service_account)
                     .execute(&mut *tx)
                     .await?;
             }
@@ -317,7 +321,7 @@ impl Database {
     ) -> (Config, std::collections::HashMap<String, String>) {
         let mut config = base.clone();
         let mut secrets = std::collections::HashMap::new();
-        let source_rows = sqlx::query("SELECT name, provider, secret_ciphertext, allowed_ips FROM sources WHERE enabled = true ORDER BY name")
+        let source_rows = sqlx::query("SELECT name, provider, secret_ciphertext, allowed_ips, audience, service_account FROM sources WHERE enabled = true ORDER BY name")
             .fetch_all(&self.pool)
             .await;
         if let Ok(rows) = source_rows
@@ -342,6 +346,11 @@ impl Database {
                     .ok()
                     .and_then(|value: Value| serde_json::from_value(value).ok())
                     .unwrap_or_default();
+                let audience = row.try_get::<Option<String>, _>("audience").ok().flatten();
+                let service_account = row
+                    .try_get::<Option<String>, _>("service_account")
+                    .ok()
+                    .flatten();
                 if let Ok(secret) = std::env::var(format!("{name}_SECRET_KEY")) {
                     secrets.insert(name.clone(), secret);
                 } else if !ciphertext.is_empty() {
@@ -366,6 +375,8 @@ impl Database {
                         provider,
                         secret_env,
                         allowed_ips,
+                        audience,
+                        service_account,
                     },
                 );
             }
@@ -511,7 +522,7 @@ impl Database {
     }
 
     pub async fn list_sources(&self) -> Result<Vec<SourceView>> {
-        let rows = sqlx::query("SELECT name, provider, allowed_ips, enabled, secret_ciphertext <> '' AS secret_present FROM sources ORDER BY name")
+        let rows = sqlx::query("SELECT name, provider, allowed_ips, audience, service_account, enabled, secret_ciphertext <> '' AS secret_present FROM sources ORDER BY name")
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter()
@@ -521,6 +532,8 @@ impl Database {
                     name: row.try_get("name")?,
                     provider: row.try_get("provider")?,
                     allowed_ips: serde_json::from_value::<Vec<String>>(allowed).unwrap_or_default(),
+                    audience: row.try_get("audience")?,
+                    service_account: row.try_get("service_account")?,
                     enabled: row.try_get("enabled")?,
                     secret_present: row.try_get("secret_present")?,
                 })
@@ -965,21 +978,26 @@ impl Database {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn save_source(
         &self,
         name: &str,
         provider: &str,
         secret: Option<&str>,
         allowed_ips: &[String],
+        audience: Option<&str>,
+        service_account: Option<&str>,
         enabled: bool,
     ) -> Result<()> {
         let ciphertext = secret.map(encrypt).transpose()?;
-        sqlx::query("INSERT INTO sources (id, name, provider, secret_ciphertext, allowed_ips, enabled, created_at, updated_at) VALUES ($1, $2, $3, COALESCE($4, ''), $5, $6, now(), now()) ON CONFLICT (name) DO UPDATE SET provider = EXCLUDED.provider, secret_ciphertext = CASE WHEN $4 IS NULL THEN sources.secret_ciphertext ELSE EXCLUDED.secret_ciphertext END, allowed_ips = EXCLUDED.allowed_ips, enabled = EXCLUDED.enabled, updated_at = now()")
+        sqlx::query("INSERT INTO sources (id, name, provider, secret_ciphertext, allowed_ips, audience, service_account, enabled, created_at, updated_at) VALUES ($1, $2, $3, COALESCE($4, ''), $5, $6, $7, $8, now(), now()) ON CONFLICT (name) DO UPDATE SET provider = EXCLUDED.provider, secret_ciphertext = CASE WHEN $4 IS NULL THEN sources.secret_ciphertext ELSE EXCLUDED.secret_ciphertext END, allowed_ips = EXCLUDED.allowed_ips, audience = EXCLUDED.audience, service_account = EXCLUDED.service_account, enabled = EXCLUDED.enabled, updated_at = now()")
             .bind(Uuid::new_v4())
             .bind(name)
             .bind(provider)
             .bind(ciphertext)
             .bind(serde_json::to_value(allowed_ips)?)
+            .bind(audience)
+            .bind(service_account)
             .bind(enabled)
             .execute(&self.pool)
             .await?;

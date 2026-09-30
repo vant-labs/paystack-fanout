@@ -24,6 +24,10 @@ pub struct SourceConfig {
     pub secret_env: String,
     #[serde(default)]
     pub allowed_ips: Vec<IpAddr>,
+    #[serde(default)]
+    pub audience: Option<String>,
+    #[serde(default)]
+    pub service_account: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -186,6 +190,8 @@ impl Config {
                     provider: "paystack".to_owned(),
                     secret_env: "PAYSTACK_SECRET_KEY".to_owned(),
                     allowed_ips: Vec::new(),
+                    audience: None,
+                    service_account: None,
                 },
             )]),
             route: Vec::new(),
@@ -272,6 +278,8 @@ mod tests {
         let source = config.source.get("paystack_main").unwrap();
         assert_eq!(source.provider, "paystack");
         assert_eq!(source.secret_env, "PAYSTACK_SECRET_KEY");
+        assert!(source.audience.is_none());
+        assert!(source.service_account.is_none());
         assert!(config.route.is_empty());
         assert_eq!(config.fallback.mode, "unrouted");
         assert_eq!(config.retention_days, 90);

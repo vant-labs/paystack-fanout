@@ -25,7 +25,7 @@ use crate::{
     config::{Config, ExtendedRouteMatcher, RouteConfig as ConfigRoute},
     db::{Database, DatabaseRoute, DatabaseRouteRecord, DatabaseRouteResponse, InsertResult},
     metrics::Metrics,
-    provider::{Provider, provider_for},
+    provider::{Provider, ProviderSettings, provider_for},
     routing::{MatchSource, database_route_records, decide_with_fields, reference},
     security::bearer_matches,
 };
@@ -264,7 +264,14 @@ pub(crate) async fn ingest(
     } else {
         String::new()
     };
-    if !provider.authenticate(secret.as_bytes(), &headers, &body) {
+    let settings = ProviderSettings {
+        audience: source_config.audience.as_deref(),
+        service_account: source_config.service_account.as_deref(),
+    };
+    if !provider
+        .authenticate_with_settings(secret.as_bytes(), &headers, &body, settings)
+        .await
+    {
         state
             .metrics
             .verified_failed
