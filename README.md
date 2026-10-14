@@ -182,7 +182,7 @@ The client purchase flow is server-authoritative:
 ```http
 POST /v1/purchases/verify
 Content-Type: application/json
-X-Timamu-Account-Id: account-123
+Authorization: Bearer <account JWT>
 
 {"provider":"apple","receipt":"<transaction-id-or-signed-transaction>"}
 ```
@@ -193,10 +193,16 @@ product mapping and environment, acknowledges pending purchases, and emits
 the same normalized event used by notifications. A purchase identity is owned
 by one account; a second account receives `409` and the attempt is audited.
 
-Clients must read `GET /v1/entitlements?account_id=account-123` (or use the
-`X-Timamu-Account-Id` header). They must not grant access from a local receipt
-or token check. Configure store sources with `provider_config` mappings such
-as `app_identifier`, `environment`, `api_base_url` (for a test server), and
+The purchase endpoints require a verified bearer identity. The account ID is
+read only from the JWT `sub` or `account_id` claim (or from a configured static
+bearer identity); body, query, and `X-Timamu-Account-Id` values are ignored or
+rejected. For Apple, the verified `appAccountToken` must equal that identity.
+Clients must read `GET /v1/entitlements` with the same bearer token. They must
+not grant access from a local receipt or token check. Set `PURCHASE_JWT_SECRET`
+for HS256 account JWTs, or use `PURCHASE_BEARER_TOKEN` together with
+`PURCHASE_BEARER_ACCOUNT_ID` for a static account-bound bearer identity.
+Configure store sources with `provider_config` mappings such as
+`app_identifier`, `environment`, `api_base_url` (for a test server), and
 `product_licence.<product-id>`. Key and service-account settings use `*_env`
 names and are resolved from secrets at runtime.
 

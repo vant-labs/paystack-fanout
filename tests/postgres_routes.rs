@@ -4,6 +4,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use paystack_fanout::{
     AppState,
     app::build_router,
@@ -56,10 +57,20 @@ async fn request(
     uri: &str,
     body: Option<Value>,
 ) -> axum::response::Response {
-    let mut builder = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("authorization", "Bearer test-admin");
+    request_with_auth(state, method, uri, body, Some("Bearer test-admin")).await
+}
+
+async fn request_with_auth(
+    state: Arc<AppState>,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    authorization: Option<&str>,
+) -> axum::response::Response {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(authorization) = authorization {
+        builder = builder.header("authorization", authorization);
+    }
     if body.is_some() {
         builder = builder.header("content-type", "application/json");
     }
@@ -73,6 +84,22 @@ async fn request(
         )
         .await
         .unwrap()
+}
+
+fn purchase_jwt(secret: &str, account_id: &str) -> String {
+    let claims = serde_json::json!({
+        "sub": account_id,
+        "exp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() + 3600,
+    });
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -114,4 +141,84 @@ async fn route_crud_and_cache_fallback_work() {
     let delete = request(state, "DELETE", &format!("/admin/routes/{name}"), None).await;
     assert_eq!(delete.status(), StatusCode::NO_CONTENT);
     db.pool.close().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn purchase_endpoints_reject_missing_and_bad_bearer_tokens() {
+    if !can_run() {
+        return;
+    }
+    let (state, _db) = setup().await;
+    let body = Some(serde_json::json!({
+        "provider": "apple",
+        "receipt": "signed-transaction"
+    }));
+
+    let missing = request_with_auth(
+        state.clone(),
+        "POST",
+        "/v1/purchases/verify",
+        body.clone(),
+        None,
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+    let bad = request_with_auth(
+        state.clone(),
+        "GET",
+        "/v1/entitlements",
+        None,
+        Some("Bearer not-a-valid-purchase-token"),
+    )
+    .await;
+    assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+#[serial]
+async fn entitlements_use_jwt_identity_instead_of_cross_account_query() {
+    if !can_run() {
+        return;
+    }
+    let (mut state, db) = setup().await;
+    let secret = "purchase-jwt-test-secret";
+    Arc::get_mut(&mut state).unwrap().purchase_jwt_secret = Some(secret.to_owned());
+    sqlx::query("TRUNCATE store_purchases, entitlement_audit CASCADE")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let token = format!("Bearer {}", purchase_jwt(secret, "account-a"));
+    let cross_account_body = request_with_auth(
+        state.clone(),
+        "POST",
+        "/v1/purchases/verify",
+        Some(serde_json::json!({
+            "provider": "apple",
+            "receipt": "signed-transaction",
+            "account_id": "account-b"
+        })),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(
+        cross_account_body.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    let response = request_with_auth(
+        state,
+        "GET",
+        "/v1/entitlements?account_id=account-b",
+        None,
+        Some(&token),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(body["account_id"], "account-a");
+    assert_eq!(body["entitlements"], serde_json::json!([]));
 }

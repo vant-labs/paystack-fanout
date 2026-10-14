@@ -14,6 +14,7 @@ use axum::{
     routing::{get, patch, post, put},
 };
 use chrono::{DateTime, Utc};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::{Duration, sleep};
@@ -45,6 +46,9 @@ pub struct AppState {
     pub trust_proxy: bool,
     pub admin_token: Option<String>,
     pub bootstrap_token: Option<String>,
+    pub purchase_jwt_secret: Option<String>,
+    pub purchase_bearer_token: Option<String>,
+    pub purchase_bearer_account_id: Option<String>,
     pub cookie_secure: bool,
     pub login_limits: Arc<std::sync::Mutex<HashMap<String, (u32, Instant)>>>,
     pub runtime_config: Arc<tokio::sync::RwLock<Config>>,
@@ -81,6 +85,11 @@ impl AppState {
             bootstrap_token: std::env::var("ADMIN_BOOTSTRAP_TOKEN")
                 .ok()
                 .or_else(|| std::env::var("ADMIN_TOKEN").ok()),
+            purchase_jwt_secret: std::env::var("PURCHASE_JWT_SECRET")
+                .ok()
+                .or_else(|| std::env::var("JWT_SECRET").ok()),
+            purchase_bearer_token: std::env::var("PURCHASE_BEARER_TOKEN").ok(),
+            purchase_bearer_account_id: std::env::var("PURCHASE_BEARER_ACCOUNT_ID").ok(),
             cookie_secure: std::env::var("COOKIE_SECURE")
                 .map(|value| !value.eq_ignore_ascii_case("false"))
                 .unwrap_or(true),
@@ -535,6 +544,7 @@ async fn apply_entitlement_event(db: &Database, event: &NormalizedEvent) -> anyh
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct VerifyPurchaseBody {
     provider: String,
     #[serde(default)]
@@ -543,26 +553,70 @@ pub(crate) struct VerifyPurchaseBody {
     purchase_token: Option<String>,
     #[serde(alias = "productId", default)]
     product_id: Option<String>,
-    #[serde(alias = "accountId", default)]
+}
+
+#[derive(Debug, Deserialize)]
+struct PurchaseIdentityClaims {
+    #[serde(default)]
+    sub: Option<String>,
+    #[serde(default, alias = "accountId")]
     account_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
-pub(crate) struct EntitlementQuery {
-    account_id: Option<String>,
-}
-
-fn request_account_id(headers: &HeaderMap, body_account_id: Option<&str>) -> Option<String> {
-    body_account_id
+fn identity_account_id(claims: PurchaseIdentityClaims) -> Option<String> {
+    if let (Some(subject), Some(account_id)) = (&claims.sub, &claims.account_id)
+        && subject != account_id
+    {
+        return None;
+    }
+    claims
+        .account_id
+        .or(claims.sub)
         .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
-        .or_else(|| {
-            headers
-                .get("x-timamu-account-id")
-                .and_then(|value| value.to_str().ok())
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_owned)
-        })
+}
+
+fn verified_purchase_account_id(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<String, StatusCode> {
+    let Some(authorization) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    let Some(token) = authorization
+        .strip_prefix("Bearer ")
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+
+    if let Some(secret) = state.purchase_jwt_secret.as_deref() {
+        let validation = Validation::new(Algorithm::HS256);
+        if let Ok(token_data) = decode::<PurchaseIdentityClaims>(
+            token,
+            &DecodingKey::from_secret(secret.as_bytes()),
+            &validation,
+        ) {
+            return identity_account_id(token_data.claims).ok_or(StatusCode::FORBIDDEN);
+        }
+    }
+
+    let static_token = state
+        .purchase_bearer_token
+        .as_deref()
+        .or(state.admin_token.as_deref())
+        .or(state.bootstrap_token.as_deref());
+    if static_token.is_some_and(|expected| bearer_matches(expected, Some(authorization))) {
+        return state
+            .purchase_bearer_account_id
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(StatusCode::FORBIDDEN);
+    }
+
+    Err(StatusCode::UNAUTHORIZED)
 }
 
 #[utoipa::path(
@@ -571,9 +625,12 @@ fn request_account_id(headers: &HeaderMap, body_account_id: Option<&str>) -> Opt
     request_body = VerifyPurchaseBody,
     responses(
         (status = 200, description = "Verified purchase accepted"),
+        (status = 401, description = "Bearer authentication failed"),
+        (status = 403, description = "Authenticated identity does not own the store account"),
         (status = 409, description = "Purchase belongs to another account"),
         (status = 422, description = "Store verification failed")
     ),
+    security(("admin_bearer" = [])),
     tag = "Purchases"
 )]
 pub(crate) async fn verify_purchase(
@@ -581,15 +638,11 @@ pub(crate) async fn verify_purchase(
     headers: HeaderMap,
     Json(body): Json<VerifyPurchaseBody>,
 ) -> Response {
-    state.refresh_runtime_if_stale().await;
-    let account_id = request_account_id(&headers, body.account_id.as_deref());
-    let Some(account_id) = account_id else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "account_id or X-Timamu-Account-Id is required"})),
-        )
-            .into_response();
+    let account_id = match verified_purchase_account_id(&state, &headers) {
+        Ok(account_id) => account_id,
+        Err(status) => return status.into_response(),
     };
+    state.refresh_runtime_if_stale().await;
     let provider_name = match body.provider.as_str() {
         "apple" | "apple_server_notifications" => "apple_server_notifications",
         "google" | "google_play" | "google_play_rtdn" => "google_play_rtdn",
@@ -652,6 +705,29 @@ pub(crate) async fn verify_purchase(
                 .into_response();
         }
     };
+    let verified_provider_account_id = event.account_id.clone();
+    if provider_name == "apple_server_notifications"
+        && verified_provider_account_id.as_deref() != Some(account_id.as_str())
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                json!({"error": "Apple appAccountToken does not match the authenticated account"}),
+            ),
+        )
+            .into_response();
+    }
+    if provider_name == "google_play_rtdn"
+        && verified_provider_account_id
+            .as_deref()
+            .is_some_and(|provider_account_id| provider_account_id != account_id)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "store account does not match the authenticated account"})),
+        )
+            .into_response();
+    }
     event.account_id = Some(account_id.clone());
     if event.licence.is_none() {
         return (
@@ -708,21 +784,17 @@ pub(crate) async fn verify_purchase(
 #[utoipa::path(
     get,
     path = "/v1/entitlements",
-    params(("account_id" = Option<String>, Query)),
     responses((status = 200, description = "Current entitlements", body = Value)),
+    security(("admin_bearer" = [])),
     tag = "Purchases"
 )]
 pub(crate) async fn list_entitlements(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<EntitlementQuery>,
 ) -> Response {
-    let Some(account_id) = request_account_id(&headers, query.account_id.as_deref()) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "account_id or X-Timamu-Account-Id is required"})),
-        )
-            .into_response();
+    let account_id = match verified_purchase_account_id(&state, &headers) {
+        Ok(account_id) => account_id,
+        Err(status) => return status.into_response(),
     };
     match state.db.list_entitlements(&account_id).await {
         Ok(entitlements) => {
