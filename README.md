@@ -106,27 +106,12 @@ peer address is used. The request body limit is 256 KiB. `RETENTION_DAYS`
 defaults to 90; delivery records are kept for 30 days and delivered event
 records follow the configured retention.
 
-### Apple Server Notifications V2
+### Store provider setup
 
-Configure an App Store Server Notifications V2 source with provider
-`apple_server_notifications`. It does not use a shared secret; the
-`secret_env` field remains for configuration compatibility. The adapter
-authenticates the outer `signedPayload` JWS, validates its `x5c` certificate
-chain to the bundled Apple Root CA - G3 certificate, and then routes on the
-signed payload's `data.bundleId` and `data.environment` values. The original
-JSON body, including the inner signed transaction and renewal information, is
-forwarded unchanged.
+The store-specific setup is documented separately:
 
-Use separate source names and routes for Production and Sandbox URLs in App
-Store Connect, for example `/in/apple_production` and `/in/apple_sandbox`.
-Set route `app_identifier` to the app's bundle ID and `environment` to
-`production` or `sandbox`. The bundled certificate was downloaded from
-[Apple PKI](https://www.apple.com/certificateauthority/); the signed payload
-format and `x5c` chain are described in Apple's
-[signedPayload](https://developer.apple.com/documentation/appstoreserverapi/signedpayload)
-and [JWSDecodedHeader](https://developer.apple.com/documentation/appstoreserverapi/jwsdecodedheader).
-The bundled certificate is stored at `src/certs/apple/AppleRootCA-G3.cer` for
-container builds.
+- [Apple App Store setup](docs/apple-store-setup.md)
+- [Google Play setup](docs/google-play-setup.md)
 
 ### App Store Connect webhooks
 
@@ -147,33 +132,6 @@ set the fallback to `route:<name>` for a whole-account destination. Keep these
 routes separate from payment routes.
 
 Apple's current setup and signing details are documented in [Manage webhooks](https://developer.apple.com/help/app-store-connect/manage-your-team/manage-webhooks), [Configuring and parsing webhook notifications](https://developer.apple.com/documentation/appstoreconnectapi/configuring-webhook-notifications), and [WebhookEventType](https://developer.apple.com/documentation/appstoreconnectapi/webhookeventtype).
-
-### Google Play Real-time developer notifications
-
-Configure a Google Play Real-time developer notifications source with provider
-`google_play_rtdn`. Google Play publishes an RTDN message to a Google Cloud
-Pub/Sub topic. Create a wrapped push subscription for the source URL
-`https://your-host/in/google_main`, enable authenticated push delivery, and
-set the configured audience to that exact URL. Set `service_account` to the
-email address of the service account that Pub/Sub uses to sign push requests.
-
-Grant the Google Play service account permission to publish to the topic, then
-configure the topic in Play Console under Monetize with Google Play →
-Monetization setup → Real-time developer notifications. The adapter validates
-the Pub/Sub Bearer JWT, refreshes Google's published signing certificates, and
-requires the configured audience, service-account email, issuer, and verified
-email claim.
-
-RTDN messages are wrapped Pub/Sub envelopes. The adapter decodes
-`message.data`, routes on the notification's `packageName`, and uses the
-Pub/Sub `messageId` as the durable deduplication key. RTDN reports a state
-change rather than the complete purchase state, so the adapter queries the
-Google Play Developer API after receiving a notification, acknowledges pending
-purchases, and periodically reconciles stored purchases. See Google's
-[RTDN reference](https://developer.android.com/google/play/billing/rtdn-reference),
-[Pub/Sub push delivery](https://cloud.google.com/pubsub/docs/push), and
-[authenticated push subscriptions](https://cloud.google.com/pubsub/docs/authenticate-push-subscriptions)
-for the provider-side setup and payload contract.
 
 ### Purchase verification and entitlements
 
