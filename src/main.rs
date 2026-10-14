@@ -7,6 +7,7 @@ use paystack_fanout::{
     auth::hash_password,
     config::Config,
     db::Database,
+    reconciliation::run_reconciliation,
     worker::run_worker,
 };
 use tracing_subscriber::EnvFilter;
@@ -81,6 +82,7 @@ async fn main() -> Result<()> {
     if matches!(args.role, Role::Worker | Role::All) {
         tokio::spawn(run_worker(state.clone()));
         tokio::spawn(retention_loop(state.clone()));
+        tokio::spawn(run_reconciliation(state.clone()));
     }
     if matches!(args.role, Role::Ingest | Role::All) {
         let address = SocketAddr::from(([0, 0, 0, 0], args.port));

@@ -3,6 +3,28 @@ provider = "paystack"
 secret_env = "PAYSTACK_SECRET_KEY"
 allowed_ips = ["52.31.139.75", "52.49.173.169", "52.214.14.220"]
 
+# Store sources use the same ingest, dedupe, routing and delivery queue.
+# Secret values are referenced by *_env settings and are never committed.
+[source.apple_production]
+provider = "apple_server_notifications"
+secret_env = "APPLE_API_PRIVATE_KEY"
+[source.apple_production.provider_config]
+app_identifier = "com.example.timamu"
+environment = "production"
+key_id_env = "APPLE_API_KEY_ID"
+issuer_id_env = "APPLE_API_ISSUER_ID"
+private_key_env = "APPLE_API_PRIVATE_KEY"
+"product_licence.com.example.timamu.monthly" = "timamu_pro"
+
+[source.google_production]
+provider = "google_play_rtdn"
+secret_env = "GOOGLE_SERVICE_ACCOUNT_JSON"
+[source.google_production.provider_config]
+app_identifier = "com.example.timamu"
+environment = "production"
+service_account_key_env = "GOOGLE_SERVICE_ACCOUNT_JSON"
+"product_licence.timamu_monthly" = "timamu_pro"
+
 [[route]]
 name = "timamu"
 destination_url = "https://example.invalid/timamu/paystack/webhook"

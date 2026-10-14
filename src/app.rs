@@ -14,18 +14,25 @@ use axum::{
     routing::{get, patch, post, put},
 };
 use chrono::{DateTime, Utc};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::{Duration, sleep};
-use utoipa::OpenApi;
+use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
 use crate::{
     config::{Config, ExtendedRouteMatcher, RouteConfig as ConfigRoute},
-    db::{Database, DatabaseRoute, DatabaseRouteRecord, DatabaseRouteResponse, InsertResult},
+    db::{
+        Database, DatabaseRoute, DatabaseRouteRecord, DatabaseRouteResponse, InsertResult,
+        PurchaseApplyResult,
+    },
     metrics::Metrics,
-    provider::{Provider, ProviderSettings, provider_for},
+    provider::{
+        NormalizedEvent, Provider, ProviderRuntimeSettings, ProviderSettings,
+        PurchaseVerificationRequest, provider_for,
+    },
     routing::{MatchSource, database_route_records, decide_with_fields, reference},
     security::bearer_matches,
 };
@@ -39,6 +46,9 @@ pub struct AppState {
     pub trust_proxy: bool,
     pub admin_token: Option<String>,
     pub bootstrap_token: Option<String>,
+    pub purchase_jwt_secret: Option<String>,
+    pub purchase_bearer_token: Option<String>,
+    pub purchase_bearer_account_id: Option<String>,
     pub cookie_secure: bool,
     pub login_limits: Arc<std::sync::Mutex<HashMap<String, (u32, Instant)>>>,
     pub runtime_config: Arc<tokio::sync::RwLock<Config>>,
@@ -75,6 +85,11 @@ impl AppState {
             bootstrap_token: std::env::var("ADMIN_BOOTSTRAP_TOKEN")
                 .ok()
                 .or_else(|| std::env::var("ADMIN_TOKEN").ok()),
+            purchase_jwt_secret: std::env::var("PURCHASE_JWT_SECRET")
+                .ok()
+                .or_else(|| std::env::var("JWT_SECRET").ok()),
+            purchase_bearer_token: std::env::var("PURCHASE_BEARER_TOKEN").ok(),
+            purchase_bearer_account_id: std::env::var("PURCHASE_BEARER_ACCOUNT_ID").ok(),
             cookie_secure: std::env::var("COOKIE_SECURE")
                 .map(|value| !value.eq_ignore_ascii_case("false"))
                 .unwrap_or(true),
@@ -178,6 +193,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                 .url("/api-docs/openapi.json", crate::openapi::ApiDoc::openapi()),
         )
         .route("/in/{source}", post(ingest))
+        .route("/v1/purchases/verify", post(verify_purchase))
+        .route("/v1/entitlements", get(list_entitlements))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
@@ -201,6 +218,71 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/admin/bootstrap", post(bootstrap_admin))
         .layer(axum::extract::DefaultBodyLimit::max(256 * 1024))
         .with_state(state)
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ResolvedProviderRuntime {
+    app_identifier: Option<String>,
+    environment: Option<String>,
+    api_base_url: Option<String>,
+    token_url: Option<String>,
+    key_id: Option<String>,
+    issuer_id: Option<String>,
+    private_key: Option<String>,
+    service_account_key: Option<String>,
+    product_licences: HashMap<String, String>,
+}
+
+impl ResolvedProviderRuntime {
+    pub(crate) fn borrowed<'a>(
+        &'a self,
+        source: &'a crate::config::SourceConfig,
+    ) -> ProviderRuntimeSettings<'a> {
+        ProviderRuntimeSettings {
+            app_identifier: self.app_identifier.as_deref(),
+            environment: self.environment.as_deref(),
+            api_base_url: self.api_base_url.as_deref(),
+            token_url: self.token_url.as_deref(),
+            key_id: self.key_id.as_deref(),
+            issuer_id: self.issuer_id.as_deref(),
+            private_key: self.private_key.as_deref(),
+            service_account_key: self.service_account_key.as_deref(),
+            service_account: source.service_account.as_deref(),
+            product_licences: Some(&self.product_licences),
+        }
+    }
+}
+
+pub(crate) fn resolve_provider_runtime(
+    source: &crate::config::SourceConfig,
+    secret: &str,
+) -> ResolvedProviderRuntime {
+    let value = |key: &str| source.provider_config.get(key).cloned();
+    let env_value = |key: &str| {
+        source
+            .provider_config
+            .get(key)
+            .and_then(|name| std::env::var(name).ok())
+    };
+    let mut product_licences = HashMap::new();
+    for (key, value) in &source.provider_config {
+        if let Some(product) = key.strip_prefix("product_licence.") {
+            product_licences.insert(product.to_owned(), value.clone());
+        }
+    }
+    ResolvedProviderRuntime {
+        app_identifier: value("app_identifier"),
+        environment: value("environment"),
+        api_base_url: value("api_base_url"),
+        token_url: value("token_url"),
+        key_id: value("key_id").or_else(|| env_value("key_id_env")),
+        issuer_id: value("issuer_id").or_else(|| env_value("issuer_id_env")),
+        private_key: env_value("private_key_env")
+            .or_else(|| (!secret.is_empty()).then(|| secret.to_owned())),
+        service_account_key: env_value("service_account_key_env")
+            .or_else(|| (!secret.is_empty()).then(|| secret.to_owned())),
+        product_licences,
+    }
 }
 
 #[axum::debug_handler]
@@ -292,9 +374,36 @@ pub(crate) async fn ingest(
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
-    let event_type = provider.event_type(&payload);
-    let event_id = provider.event_id(&payload, &body);
-    let routing_fields = provider.routing_fields(&payload);
+    let provider_runtime = resolve_provider_runtime(source_config, &secret);
+    let initial_normalized = provider.normalize_event_with_settings(
+        &payload,
+        &body,
+        provider_runtime.borrowed(source_config),
+    );
+    let normalized = match initial_normalized {
+        Some(event) => provider
+            .enrich_normalized_event(
+                event.clone(),
+                provider_runtime.borrowed(source_config),
+                &state.http,
+            )
+            .await
+            .ok()
+            .or(Some(event)),
+        None => None,
+    };
+    let event_type = normalized
+        .as_ref()
+        .map(|event| event.event_type().to_owned())
+        .unwrap_or_else(|| provider.event_type(&payload));
+    let event_id = normalized
+        .as_ref()
+        .map(|event| event.event_id.clone())
+        .unwrap_or_else(|| provider.event_id(&payload, &body));
+    let routing_fields = normalized
+        .as_ref()
+        .map(NormalizedEvent::routing_fields)
+        .unwrap_or_else(|| provider.routing_fields(&payload));
     let database_routes = state.cached_route_records().await;
     let database_match = database_route_records(&database_routes, &routing_fields);
     let database_route_id = database_match.map(|route| route.route.id);
@@ -328,13 +437,26 @@ pub(crate) async fn ingest(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json");
     let stored_headers = headers_to_json(&headers, provider);
-    let dedupe = provider.dedupe_key(&payload, &body);
+    if let Some(event) = normalized.as_ref()
+        && let Err(error) = apply_entitlement_event(&state.db, event).await
+    {
+        tracing::warn!(source = %source, error = %error, "normalized purchase event was rejected");
+        return StatusCode::CONFLICT.into_response();
+    }
+    let normalized_body = normalized
+        .as_ref()
+        .and_then(|event| serde_json::to_vec(event).ok());
+    let dedupe = normalized
+        .as_ref()
+        .map(|event| event.event_id.clone())
+        .unwrap_or_else(|| provider.dedupe_key(&payload, &body));
     let inserted = match state
         .db
-        .insert_event_with_provider_event_id(
+        .insert_event_with_provider_event_id_and_normalized(
             &source,
             &event_type,
             &body,
+            normalized_body.as_deref(),
             content_type,
             signature.unwrap_or_default(),
             &stored_headers,
@@ -408,6 +530,351 @@ pub(crate) async fn ingest(
         }
     }
     StatusCode::OK.into_response()
+}
+
+async fn apply_entitlement_event(db: &Database, event: &NormalizedEvent) -> anyhow::Result<()> {
+    match db.apply_normalized_event(event).await? {
+        PurchaseApplyResult::CrossAccountReplay => {
+            anyhow::bail!("store purchase is already owned by another account")
+        }
+        PurchaseApplyResult::Applied
+        | PurchaseApplyResult::Unowned
+        | PurchaseApplyResult::UnmappedProduct => Ok(()),
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VerifyPurchaseBody {
+    provider: String,
+    #[serde(default)]
+    receipt: Option<String>,
+    #[serde(alias = "purchaseToken", default)]
+    purchase_token: Option<String>,
+    #[serde(alias = "productId", default)]
+    product_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PurchaseIdentityClaims {
+    #[serde(default)]
+    sub: Option<String>,
+    #[serde(default, alias = "accountId")]
+    account_id: Option<String>,
+}
+
+fn identity_account_id(claims: PurchaseIdentityClaims) -> Option<String> {
+    if let (Some(subject), Some(account_id)) = (&claims.sub, &claims.account_id)
+        && subject != account_id
+    {
+        return None;
+    }
+    claims
+        .account_id
+        .or(claims.sub)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn verified_purchase_account_id(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<String, StatusCode> {
+    let Some(authorization) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    let Some(token) = authorization
+        .strip_prefix("Bearer ")
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+
+    if let Some(secret) = state.purchase_jwt_secret.as_deref() {
+        let validation = Validation::new(Algorithm::HS256);
+        if let Ok(token_data) = decode::<PurchaseIdentityClaims>(
+            token,
+            &DecodingKey::from_secret(secret.as_bytes()),
+            &validation,
+        ) {
+            return identity_account_id(token_data.claims).ok_or(StatusCode::FORBIDDEN);
+        }
+    }
+
+    let static_token = state
+        .purchase_bearer_token
+        .as_deref()
+        .or(state.admin_token.as_deref())
+        .or(state.bootstrap_token.as_deref());
+    if static_token.is_some_and(|expected| bearer_matches(expected, Some(authorization))) {
+        return state
+            .purchase_bearer_account_id
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(StatusCode::FORBIDDEN);
+    }
+
+    Err(StatusCode::UNAUTHORIZED)
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/purchases/verify",
+    request_body = VerifyPurchaseBody,
+    responses(
+        (status = 200, description = "Verified purchase accepted"),
+        (status = 401, description = "Bearer authentication failed"),
+        (status = 403, description = "Authenticated identity does not own the store account"),
+        (status = 409, description = "Purchase belongs to another account"),
+        (status = 422, description = "Store verification failed")
+    ),
+    security(("admin_bearer" = [])),
+    tag = "Purchases"
+)]
+pub(crate) async fn verify_purchase(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<VerifyPurchaseBody>,
+) -> Response {
+    let account_id = match verified_purchase_account_id(&state, &headers) {
+        Ok(account_id) => account_id,
+        Err(status) => return status.into_response(),
+    };
+    state.refresh_runtime_if_stale().await;
+    let provider_name = match body.provider.as_str() {
+        "apple" | "apple_server_notifications" => "apple_server_notifications",
+        "google" | "google_play" | "google_play_rtdn" => "google_play_rtdn",
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "provider must be apple or google"})),
+            )
+                .into_response();
+        }
+    };
+    let active_config = state.runtime_config.read().await.clone();
+    let Some((source_name, source_config)) = active_config
+        .source
+        .iter()
+        .find(|(_, source)| source.provider == provider_name)
+    else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": "provider is not configured"})),
+        )
+            .into_response();
+    };
+    let provider = provider_for(provider_name).expect("validated provider name");
+    let secret = state
+        .runtime_secrets
+        .read()
+        .await
+        .get(source_name)
+        .cloned()
+        .or_else(|| active_config.secret_for(source_name).ok())
+        .unwrap_or_default();
+    let runtime = resolve_provider_runtime(source_config, &secret);
+    let receipt = body
+        .receipt
+        .or(body.purchase_token)
+        .filter(|value| !value.trim().is_empty());
+    let Some(receipt) = receipt else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "receipt or purchaseToken is required"})),
+        )
+            .into_response();
+    };
+    let request = PurchaseVerificationRequest {
+        receipt,
+        product_id: body.product_id,
+    };
+    let mut event = match provider
+        .verify_purchase(&request, runtime.borrowed(source_config), &state.http)
+        .await
+    {
+        Ok(event) => event,
+        Err(error) => {
+            tracing::warn!(provider = provider.name(), error = %error, "purchase verification failed");
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error": "purchase could not be verified"})),
+            )
+                .into_response();
+        }
+    };
+    let verified_provider_account_id = event.account_id.clone();
+    if provider_name == "apple_server_notifications"
+        && verified_provider_account_id.as_deref() != Some(account_id.as_str())
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                json!({"error": "Apple appAccountToken does not match the authenticated account"}),
+            ),
+        )
+            .into_response();
+    }
+    if provider_name == "google_play_rtdn"
+        && verified_provider_account_id
+            .as_deref()
+            .is_some_and(|provider_account_id| provider_account_id != account_id)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "store account does not match the authenticated account"})),
+        )
+            .into_response();
+    }
+    event.account_id = Some(account_id.clone());
+    if event.licence.is_none() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": "product is not mapped to a licence"})),
+        )
+            .into_response();
+    }
+    match state.db.apply_normalized_event(&event).await {
+        Ok(PurchaseApplyResult::CrossAccountReplay) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "purchase belongs to another account"})),
+            )
+                .into_response();
+        }
+        Ok(PurchaseApplyResult::Applied) => {}
+        Ok(PurchaseApplyResult::Unowned | PurchaseApplyResult::UnmappedProduct) => {
+            return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "storing entitlement failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+    let raw_body = serde_json::to_vec(&json!({
+        "provider": body.provider,
+        "receipt": request.receipt,
+        "product_id": request.product_id,
+        "account_id": account_id,
+    }))
+    .unwrap_or_default();
+    let normalized_body = serde_json::to_vec(&event).unwrap_or_default();
+    if let Err(error) = store_normalized_event(
+        &state,
+        source_name,
+        provider,
+        &event,
+        &raw_body,
+        &normalized_body,
+    )
+    .await
+    {
+        tracing::error!(error = %error, "storing verified purchase event failed");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(json!({"status": "verified", "event_id": event.event_id})),
+    )
+        .into_response()
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/entitlements",
+    responses((status = 200, description = "Current entitlements", body = Value)),
+    security(("admin_bearer" = [])),
+    tag = "Purchases"
+)]
+pub(crate) async fn list_entitlements(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    let account_id = match verified_purchase_account_id(&state, &headers) {
+        Ok(account_id) => account_id,
+        Err(status) => return status.into_response(),
+    };
+    match state.db.list_entitlements(&account_id).await {
+        Ok(entitlements) => {
+            Json(json!({"account_id": account_id, "entitlements": entitlements})).into_response()
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "listing entitlements failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn store_normalized_event(
+    state: &AppState,
+    source: &str,
+    provider: &dyn Provider,
+    event: &NormalizedEvent,
+    raw_body: &[u8],
+    normalized_body: &[u8],
+) -> anyhow::Result<()> {
+    let fields = event.routing_fields();
+    let database_routes = state.cached_route_records().await;
+    let database_match = database_route_records(&database_routes, &fields);
+    let database_route_id = database_match.map(|route| route.route.id);
+    let active_config = state.runtime_config.read().await.clone();
+    let decision = if let Some(route) = database_match {
+        crate::routing::RouteDecision {
+            source: crate::routing::match_source(&route.matcher, &fields)
+                .unwrap_or(MatchSource::Fallback),
+            route: Some(ConfigRoute {
+                name: route.route.name.clone(),
+                destination_url: route.route.target_url.clone(),
+                matcher: crate::config::RouteMatcher::from_extended(route.matcher.clone()),
+            }),
+        }
+    } else {
+        decide_with_fields(&active_config, &Value::Null, &fields)
+    };
+    let matched_route = decision.route.as_ref().map(|route| route.name.as_str());
+    let status = if matched_route.is_some() {
+        "pending"
+    } else {
+        "unrouted"
+    };
+    let headers = json!({"content-type": "application/json"});
+    let inserted = state
+        .db
+        .insert_event_with_provider_event_id_and_normalized(
+            source,
+            event.event_type(),
+            raw_body,
+            Some(normalized_body),
+            "application/json",
+            "",
+            &headers,
+            &event.event_id,
+            &event.event_id,
+            matched_route,
+            Some("provider_verification"),
+            status,
+            decision
+                .route
+                .as_ref()
+                .map(|route| route.destination_url.as_str()),
+        )
+        .await?;
+    if let InsertResult::Inserted { event_id } = inserted {
+        state
+            .db
+            .annotate_delivery(
+                event_id,
+                event.event_type(),
+                Some(&event.product_id),
+                database_route_id,
+                matched_route.is_some(),
+            )
+            .await?;
+    }
+    let _ = provider;
+    Ok(())
 }
 
 fn allowed_ip(

@@ -28,6 +28,10 @@ pub struct SourceConfig {
     pub audience: Option<String>,
     #[serde(default)]
     pub service_account: Option<String>,
+    /// Non-secret provider settings. Values ending in `_env` name an
+    /// environment variable; secret material is never stored in this map.
+    #[serde(default)]
+    pub provider_config: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -192,6 +196,7 @@ impl Config {
                     allowed_ips: Vec::new(),
                     audience: None,
                     service_account: None,
+                    provider_config: HashMap::new(),
                 },
             )]),
             route: Vec::new(),

@@ -4,16 +4,21 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use axum::http::HeaderMap;
 use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use chrono::{TimeZone, Utc};
+use jsonwebtoken::{
+    Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
+};
 use ring::signature::{ECDSA_P256_SHA256_FIXED, UnparsedPublicKey};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::Digest;
 use tokio::sync::RwLock;
 use x509_parser::{pem::parse_x509_pem, prelude::parse_x509_certificate, public_key::PublicKey};
 
@@ -27,6 +32,94 @@ pub struct RoutingFields {
     pub reference: Option<String>,
     pub app_identifier: Option<String>,
     pub environment: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NormalizedEventKind {
+    Purchase,
+    Renew,
+    Expire,
+    Grace,
+    Refund,
+    Revoke,
+    Upgrade,
+    Downgrade,
+}
+
+impl NormalizedEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Purchase => "purchase",
+            Self::Renew => "renew",
+            Self::Expire => "expire",
+            Self::Grace => "grace",
+            Self::Refund => "refund",
+            Self::Revoke => "revoke",
+            Self::Upgrade => "upgrade",
+            Self::Downgrade => "downgrade",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NormalizedEvent {
+    pub schema_version: u8,
+    pub provider: String,
+    pub event_id: String,
+    pub kind: NormalizedEventKind,
+    pub account_id: Option<String>,
+    pub transaction_id: Option<String>,
+    pub original_transaction_id: Option<String>,
+    pub purchase_token: Option<String>,
+    pub product_id: String,
+    pub licence: Option<String>,
+    pub app_identifier: String,
+    pub environment: String,
+    pub expires_at: Option<String>,
+    pub raw: Value,
+}
+
+impl NormalizedEvent {
+    pub fn event_type(&self) -> &'static str {
+        self.kind.as_str()
+    }
+
+    pub fn purchase_key(&self) -> Option<String> {
+        self.original_transaction_id
+            .clone()
+            .or_else(|| self.purchase_token.clone())
+            .or_else(|| self.transaction_id.clone())
+    }
+
+    pub fn routing_fields(&self) -> RoutingFields {
+        RoutingFields {
+            app_identifier: Some(self.app_identifier.clone()),
+            environment: Some(self.environment.clone()),
+            plan_code: self.licence.clone(),
+            ..RoutingFields::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PurchaseVerificationRequest {
+    pub receipt: String,
+    pub product_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProviderRuntimeSettings<'a> {
+    pub app_identifier: Option<&'a str>,
+    pub environment: Option<&'a str>,
+    pub api_base_url: Option<&'a str>,
+    pub token_url: Option<&'a str>,
+    pub key_id: Option<&'a str>,
+    pub issuer_id: Option<&'a str>,
+    pub private_key: Option<&'a str>,
+    pub service_account_key: Option<&'a str>,
+    pub service_account: Option<&'a str>,
+    pub product_licences: Option<&'a HashMap<String, String>>,
 }
 
 /// Provider boundary for authentication and provider-specific event metadata.
@@ -63,6 +156,36 @@ pub trait Provider: Send + Sync {
         self.event_id(payload, raw_body)
     }
     fn routing_fields(&self, payload: &Value) -> RoutingFields;
+    fn normalize_event(&self, _payload: &Value, _raw_body: &[u8]) -> Option<NormalizedEvent> {
+        None
+    }
+    fn normalize_event_with_settings(
+        &self,
+        payload: &Value,
+        raw_body: &[u8],
+        _settings: ProviderRuntimeSettings<'_>,
+    ) -> Option<NormalizedEvent> {
+        self.normalize_event(payload, raw_body)
+    }
+    async fn enrich_normalized_event(
+        &self,
+        event: NormalizedEvent,
+        _settings: ProviderRuntimeSettings<'_>,
+        _http: &reqwest::Client,
+    ) -> Result<NormalizedEvent> {
+        Ok(event)
+    }
+    async fn verify_purchase(
+        &self,
+        _request: &PurchaseVerificationRequest,
+        _settings: ProviderRuntimeSettings<'_>,
+        _http: &reqwest::Client,
+    ) -> Result<NormalizedEvent> {
+        bail!(
+            "purchase verification is not implemented for {}",
+            self.name()
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -125,6 +248,7 @@ impl AppleServerNotificationsProvider {
     }
 }
 
+#[async_trait]
 impl Provider for AppleServerNotificationsProvider {
     fn name(&self) -> &'static str {
         "apple_server_notifications"
@@ -195,6 +319,253 @@ impl Provider for AppleServerNotificationsProvider {
             ..RoutingFields::default()
         }
     }
+
+    fn normalize_event(&self, payload: &Value, raw_body: &[u8]) -> Option<NormalizedEvent> {
+        apple_normalized_event(payload, raw_body, self.trusted_root, None)
+    }
+
+    fn normalize_event_with_settings(
+        &self,
+        payload: &Value,
+        raw_body: &[u8],
+        settings: ProviderRuntimeSettings<'_>,
+    ) -> Option<NormalizedEvent> {
+        apple_normalized_event(payload, raw_body, self.trusted_root, Some(settings))
+    }
+
+    async fn verify_purchase(
+        &self,
+        request: &PurchaseVerificationRequest,
+        settings: ProviderRuntimeSettings<'_>,
+        http: &reqwest::Client,
+    ) -> Result<NormalizedEvent> {
+        let receipt = request.receipt.trim();
+        if receipt.is_empty() {
+            bail!("receipt is empty");
+        }
+        let signed_claims = if receipt.split('.').count() == 3 {
+            verify_signed_payload(receipt, self.trusted_root)
+        } else {
+            None
+        };
+        let transaction_id = signed_claims
+            .as_ref()
+            .and_then(|claims| claims.get("transactionId").and_then(Value::as_str))
+            .unwrap_or(receipt)
+            .to_owned();
+        let signed_transaction = if let Some(base_url) = settings.api_base_url {
+            let private_key = settings
+                .private_key
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("Apple API private key is not configured"))?;
+            let issuer_id = settings
+                .issuer_id
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("Apple API issuer ID is not configured"))?;
+            let key_id = settings
+                .key_id
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("Apple API key ID is not configured"))?;
+            let token = apple_api_token(key_id, issuer_id, private_key, settings.app_identifier)?;
+            let url = format!(
+                "{}/inApps/v1/transactions/{}",
+                base_url.trim_end_matches('/'),
+                transaction_id
+            );
+            let response = http.get(url).bearer_auth(token).send().await?;
+            if !response.status().is_success() {
+                bail!("Apple transaction lookup returned {}", response.status());
+            }
+            let response: Value = response.json().await?;
+            let signed = response
+                .get("signedTransactionInfo")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("Apple response has no signed transaction"))?;
+            verify_signed_payload(signed, self.trusted_root)
+                .ok_or_else(|| anyhow!("Apple transaction signature verification failed"))?;
+            signed.to_owned()
+        } else {
+            signed_claims
+                .ok_or_else(|| anyhow!("receipt must be an Apple-signed transaction JWS"))?;
+            receipt.to_owned()
+        };
+        let payload = serde_json::json!({"signedPayload": signed_transaction});
+        apple_normalized_event(
+            &payload,
+            receipt.as_bytes(),
+            self.trusted_root,
+            Some(settings),
+        )
+        .ok_or_else(|| anyhow!("Apple transaction does not contain a valid purchase"))
+    }
+}
+
+fn apple_api_token(
+    key_id: &str,
+    issuer_id: &str,
+    private_key: &str,
+    bundle_id: Option<&str>,
+) -> Result<String> {
+    let mut header = Header::new(Algorithm::ES256);
+    header.kid = Some(key_id.to_owned());
+    let now = Utc::now().timestamp();
+    let mut claims = serde_json::json!({
+        "iss": issuer_id,
+        "iat": now,
+        "exp": now + 300,
+        "aud": "appstoreconnect-v1"
+    });
+    if let Some(bundle_id) = bundle_id.filter(|value| !value.is_empty()) {
+        claims["bid"] = Value::String(bundle_id.to_owned());
+    }
+    let key = EncodingKey::from_ec_pem(private_key.as_bytes())
+        .map_err(|error| anyhow!("invalid Apple API private key: {error}"))?;
+    encode(&header, &claims, &key).map_err(Into::into)
+}
+
+fn apple_normalized_event(
+    payload: &Value,
+    raw_body: &[u8],
+    trusted_root: &[u8],
+    settings: Option<ProviderRuntimeSettings<'_>>,
+) -> Option<NormalizedEvent> {
+    let claims = signed_payload_claims(payload)?;
+    let data = claims.get("data").unwrap_or(&claims);
+    let transaction = data
+        .get("signedTransactionInfo")
+        .and_then(Value::as_str)
+        .and_then(|signed| verify_signed_payload(signed, trusted_root))
+        .or_else(|| data.get("transactionInfo").cloned())
+        .unwrap_or_else(|| data.clone());
+    let notification_type = claims
+        .get("notificationType")
+        .and_then(Value::as_str)
+        .unwrap_or("SUBSCRIBED");
+    let subtype = claims.get("subtype").and_then(Value::as_str);
+    let mut kind = apple_event_kind(notification_type, subtype, &transaction, data)?;
+    if notification_type == "SUBSCRIBED" {
+        if transaction.get("revocationDate").is_some() {
+            kind = NormalizedEventKind::Revoke;
+        } else if date_from_millis(transaction.get("expiresDate"))
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+            .is_some_and(|value| value.with_timezone(&Utc) <= Utc::now())
+        {
+            kind = NormalizedEventKind::Expire;
+        }
+    }
+    let app_identifier = transaction
+        .get("bundleId")
+        .and_then(Value::as_str)
+        .or_else(|| data.get("bundleId").and_then(Value::as_str))?;
+    let environment = transaction
+        .get("environment")
+        .and_then(Value::as_str)
+        .or_else(|| data.get("environment").and_then(Value::as_str))
+        .and_then(normalize_environment)?;
+    if let Some(settings) = settings.as_ref() {
+        let expected_app = settings.app_identifier?;
+        let expected_environment = settings.environment?;
+        if expected_app != app_identifier {
+            return None;
+        }
+        if normalize_environment(expected_environment) != Some(environment.clone()) {
+            return None;
+        }
+    }
+    let product_id = transaction
+        .get("productId")
+        .and_then(Value::as_str)
+        .or_else(|| data.get("productId").and_then(Value::as_str))?;
+    let event_id = claims
+        .get("notificationUUID")
+        .and_then(Value::as_str)
+        .or_else(|| transaction.get("transactionId").and_then(Value::as_str))
+        .unwrap_or("apple-unknown");
+    let licence = settings
+        .and_then(|settings| settings.product_licences)
+        .and_then(|mapping| mapping.get(product_id))
+        .cloned();
+    Some(NormalizedEvent {
+        schema_version: 1,
+        provider: "apple".to_owned(),
+        event_id: event_id.to_owned(),
+        kind,
+        account_id: transaction
+            .get("appAccountToken")
+            .and_then(Value::as_str)
+            .or_else(|| data.get("appAccountToken").and_then(Value::as_str))
+            .map(str::to_owned),
+        transaction_id: transaction
+            .get("transactionId")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        original_transaction_id: transaction
+            .get("originalTransactionId")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        purchase_token: None,
+        product_id: product_id.to_owned(),
+        licence,
+        app_identifier: app_identifier.to_owned(),
+        environment,
+        expires_at: date_from_millis(transaction.get("expiresDate")),
+        raw: serde_json::json!({
+            "notification": claims,
+            "transaction": transaction,
+            "body_sha256": hex::encode(sha2::Sha256::digest(raw_body)),
+        }),
+    })
+}
+
+fn apple_event_kind(
+    notification_type: &str,
+    subtype: Option<&str>,
+    transaction: &Value,
+    data: &Value,
+) -> Option<NormalizedEventKind> {
+    Some(match notification_type {
+        "SUBSCRIBED" => NormalizedEventKind::Purchase,
+        "DID_RENEW" | "DID_RECOVER" => NormalizedEventKind::Renew,
+        "EXPIRED" | "GRACE_PERIOD_EXPIRED" => NormalizedEventKind::Expire,
+        "DID_FAIL_TO_RENEW" if subtype == Some("GRACE_PERIOD") => NormalizedEventKind::Grace,
+        "DID_FAIL_TO_RENEW" => NormalizedEventKind::Expire,
+        "REFUND" => NormalizedEventKind::Refund,
+        "REVOKE" => NormalizedEventKind::Revoke,
+        "DID_CHANGE_RENEWAL_PREF" => {
+            let current = transaction.get("productId").and_then(Value::as_str);
+            let next = data
+                .get("signedRenewalInfo")
+                .and_then(Value::as_str)
+                .and_then(decode_jws_claims)
+                .and_then(|renewal| {
+                    renewal
+                        .get("autoRenewProductId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                });
+            if current.is_some() && next.is_some() && current != next.as_deref() {
+                NormalizedEventKind::Upgrade
+            } else {
+                NormalizedEventKind::Downgrade
+            }
+        }
+        _ => return None,
+    })
+}
+
+fn date_from_millis(value: Option<&Value>) -> Option<String> {
+    let millis = value.and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))?;
+    Utc.timestamp_millis_opt(millis)
+        .single()
+        .map(|value| value.to_rfc3339())
+}
+
+fn decode_jws_claims(jws: &str) -> Option<Value> {
+    let parts = jws.split('.').collect::<Vec<_>>();
+    (parts.len() == 3)
+        .then(|| URL_SAFE_NO_PAD.decode(parts[1]).ok())
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -460,6 +831,414 @@ impl Provider for GooglePlayRtdnProvider {
             })
             .unwrap_or_default()
     }
+
+    fn normalize_event(&self, payload: &Value, _raw_body: &[u8]) -> Option<NormalizedEvent> {
+        google_normalized_event(payload, None)
+    }
+
+    fn normalize_event_with_settings(
+        &self,
+        payload: &Value,
+        _raw_body: &[u8],
+        settings: ProviderRuntimeSettings<'_>,
+    ) -> Option<NormalizedEvent> {
+        google_normalized_event(payload, Some(settings))
+    }
+
+    async fn verify_purchase(
+        &self,
+        request: &PurchaseVerificationRequest,
+        settings: ProviderRuntimeSettings<'_>,
+        http: &reqwest::Client,
+    ) -> Result<NormalizedEvent> {
+        let package = settings
+            .app_identifier
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("Google package name is not configured"))?;
+        let credential = settings
+            .service_account_key
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("Google service-account key is not configured"))?;
+        let access_token = google_access_token(
+            http,
+            credential,
+            settings.service_account,
+            settings.token_url,
+        )
+        .await?;
+        let base_url = settings
+            .api_base_url
+            .unwrap_or("https://androidpublisher.googleapis.com");
+        let token = request.receipt.trim();
+        if token.is_empty() {
+            bail!("purchase token is empty");
+        }
+        let url = format!(
+            "{}/androidpublisher/v3/applications/{}/purchases/subscriptionsv2/tokens/{}",
+            base_url.trim_end_matches('/'),
+            package,
+            token
+        );
+        let response = http.get(url).bearer_auth(&access_token).send().await?;
+        let (response, is_subscription) = if response.status().is_success() {
+            let purchase: Value = response.json().await?;
+            (
+                google_subscription_event(
+                    package,
+                    token,
+                    &purchase,
+                    settings.environment,
+                    settings.product_licences,
+                )?,
+                true,
+            )
+        } else if response.status() == reqwest::StatusCode::NOT_FOUND {
+            let product_id = request
+                .product_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("product_id is required for a one-time Google purchase"))?;
+            let url = format!(
+                "{}/androidpublisher/v3/applications/{}/purchases/products/{}/tokens/{}",
+                base_url.trim_end_matches('/'),
+                package,
+                product_id,
+                token
+            );
+            let response = http.get(url).bearer_auth(&access_token).send().await?;
+            if !response.status().is_success() {
+                bail!("Google purchase lookup returned {}", response.status());
+            }
+            let purchase: Value = response.json().await?;
+            (
+                google_product_event(
+                    package,
+                    token,
+                    product_id,
+                    &purchase,
+                    settings.environment,
+                    settings.product_licences,
+                )?,
+                false,
+            )
+        } else {
+            bail!("Google subscription lookup returned {}", response.status());
+        };
+        if google_ack_pending(&response.raw) {
+            let product = response.product_id.clone();
+            let url = if is_subscription {
+                format!(
+                    "{}/androidpublisher/v3/applications/{}/purchases/subscriptions/{}/tokens/{}:acknowledge",
+                    base_url.trim_end_matches('/'),
+                    package,
+                    product,
+                    token
+                )
+            } else {
+                format!(
+                    "{}/androidpublisher/v3/applications/{}/purchases/products/{}/tokens/{}:acknowledge",
+                    base_url.trim_end_matches('/'),
+                    package,
+                    product,
+                    token
+                )
+            };
+            let ack = http
+                .post(url)
+                .bearer_auth(&access_token)
+                .json(&serde_json::json!({}))
+                .send()
+                .await?;
+            if !ack.status().is_success() {
+                bail!("Google purchase acknowledgement returned {}", ack.status());
+            }
+        }
+        Ok(response)
+    }
+
+    async fn enrich_normalized_event(
+        &self,
+        event: NormalizedEvent,
+        settings: ProviderRuntimeSettings<'_>,
+        http: &reqwest::Client,
+    ) -> Result<NormalizedEvent> {
+        let Some(token) = event.purchase_token.clone() else {
+            return Ok(event);
+        };
+        let request = PurchaseVerificationRequest {
+            receipt: token,
+            product_id: (event.product_id != "unknown").then(|| event.product_id.clone()),
+        };
+        let mut verified = self.verify_purchase(&request, settings, http).await?;
+        verified.event_id = event.event_id;
+        verified.kind = event.kind;
+        Ok(verified)
+    }
+}
+
+fn google_ack_pending(purchase: &Value) -> bool {
+    purchase
+        .get("acknowledgementState")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "ACKNOWLEDGEMENT_STATE_PENDING")
+        || purchase
+            .get("acknowledgementState")
+            .and_then(Value::as_u64)
+            .is_some_and(|value| value == 0)
+}
+
+fn google_normalized_event(
+    payload: &Value,
+    settings: Option<ProviderRuntimeSettings<'_>>,
+) -> Option<NormalizedEvent> {
+    let notification = decoded_google_notification(payload)?;
+    let package = notification.get("packageName").and_then(Value::as_str)?;
+    let event_id = payload
+        .pointer("/message/messageId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload
+                .pointer("/message/message_id")
+                .and_then(Value::as_str)
+        })?;
+    let (kind, token, product_id) =
+        if let Some(value) = notification.get("subscriptionNotification") {
+            let kind = google_subscription_kind(value.get("notificationType")?.as_u64()?)?;
+            (
+                kind,
+                value.get("purchaseToken")?.as_str()?.to_owned(),
+                value
+                    .get("subscriptionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+            )
+        } else if let Some(value) = notification.get("oneTimeProductNotification") {
+            let kind = match value.get("notificationType")?.as_u64()? {
+                1 => NormalizedEventKind::Purchase,
+                2 => NormalizedEventKind::Refund,
+                _ => return None,
+            };
+            (
+                kind,
+                value.get("purchaseToken")?.as_str()?.to_owned(),
+                value.get("sku")?.as_str()?.to_owned(),
+            )
+        } else if let Some(value) = notification.get("voidedPurchaseNotification") {
+            (
+                NormalizedEventKind::Refund,
+                value.get("purchaseToken")?.as_str()?.to_owned(),
+                "unknown".to_owned(),
+            )
+        } else {
+            return None;
+        };
+    let (environment, licence) = match settings {
+        Some(settings) => (
+            settings.environment.and_then(normalize_environment)?,
+            settings
+                .product_licences
+                .and_then(|mapping| mapping.get(&product_id))
+                .cloned(),
+        ),
+        None => ("production".to_owned(), None),
+    };
+    Some(NormalizedEvent {
+        schema_version: 1,
+        provider: "google".to_owned(),
+        event_id: event_id.to_owned(),
+        kind,
+        account_id: None,
+        transaction_id: None,
+        original_transaction_id: None,
+        purchase_token: Some(token),
+        product_id,
+        licence,
+        app_identifier: package.to_owned(),
+        environment,
+        expires_at: None,
+        raw: notification,
+    })
+}
+
+fn google_subscription_kind(notification_type: u64) -> Option<NormalizedEventKind> {
+    Some(match notification_type {
+        1 | 2 | 7 | 9 => NormalizedEventKind::Renew,
+        3 | 12 | 20 => NormalizedEventKind::Revoke,
+        4 => NormalizedEventKind::Purchase,
+        5 | 6 | 10 | 11 | 22 => NormalizedEventKind::Grace,
+        13 => NormalizedEventKind::Expire,
+        17 => NormalizedEventKind::Upgrade,
+        _ => return None,
+    })
+}
+
+fn google_subscription_event(
+    package: &str,
+    token: &str,
+    purchase: &Value,
+    environment: Option<&str>,
+    product_licences: Option<&HashMap<String, String>>,
+) -> Result<NormalizedEvent> {
+    let line = purchase
+        .get("lineItems")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .ok_or_else(|| anyhow!("Google subscription has no line item"))?;
+    let product_id = line
+        .get("productId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("Google subscription has no product ID"))?;
+    let state = purchase
+        .get("subscriptionState")
+        .and_then(Value::as_str)
+        .unwrap_or("SUBSCRIPTION_STATE_UNSPECIFIED");
+    let kind = match state {
+        "SUBSCRIPTION_STATE_ACTIVE" => NormalizedEventKind::Purchase,
+        "SUBSCRIPTION_STATE_IN_GRACE_PERIOD" => NormalizedEventKind::Grace,
+        "SUBSCRIPTION_STATE_EXPIRED" => NormalizedEventKind::Expire,
+        "SUBSCRIPTION_STATE_CANCELED" => NormalizedEventKind::Revoke,
+        _ => NormalizedEventKind::Purchase,
+    };
+    normalized_google_purchase(
+        package,
+        token,
+        product_id,
+        kind,
+        purchase,
+        environment,
+        product_licences,
+    )
+}
+
+fn google_product_event(
+    package: &str,
+    token: &str,
+    product_id: &str,
+    purchase: &Value,
+    environment: Option<&str>,
+    product_licences: Option<&HashMap<String, String>>,
+) -> Result<NormalizedEvent> {
+    let kind = match purchase.get("purchaseState").and_then(Value::as_u64) {
+        Some(1) => NormalizedEventKind::Refund,
+        _ => NormalizedEventKind::Purchase,
+    };
+    normalized_google_purchase(
+        package,
+        token,
+        product_id,
+        kind,
+        purchase,
+        environment,
+        product_licences,
+    )
+}
+
+fn normalized_google_purchase(
+    package: &str,
+    token: &str,
+    product_id: &str,
+    kind: NormalizedEventKind,
+    purchase: &Value,
+    environment: Option<&str>,
+    product_licences: Option<&HashMap<String, String>>,
+) -> Result<NormalizedEvent> {
+    let environment = environment
+        .and_then(normalize_environment)
+        .ok_or_else(|| anyhow!("Google environment is not configured"))?;
+    if environment == "production"
+        && (purchase.get("testPurchase").is_some()
+            || purchase.get("purchaseType").and_then(Value::as_u64) == Some(0))
+    {
+        bail!("Google test purchase is not accepted in production");
+    }
+    Ok(NormalizedEvent {
+        schema_version: 1,
+        provider: "google".to_owned(),
+        event_id: purchase
+            .get("latestOrderId")
+            .and_then(Value::as_str)
+            .unwrap_or(token)
+            .to_owned(),
+        kind,
+        account_id: purchase
+            .pointer("/externalAccountIdentifiers/externalAccountId")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                purchase
+                    .pointer("/externalAccountIdentifiers/obfuscatedExternalAccountId")
+                    .and_then(Value::as_str)
+            })
+            .map(str::to_owned),
+        transaction_id: purchase
+            .get("latestOrderId")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        original_transaction_id: None,
+        purchase_token: Some(token.to_owned()),
+        product_id: product_id.to_owned(),
+        licence: product_licences
+            .and_then(|mapping| mapping.get(product_id))
+            .cloned(),
+        app_identifier: package.to_owned(),
+        environment,
+        expires_at: purchase
+            .pointer("/lineItems/0/expiryTime")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        raw: purchase.clone(),
+    })
+}
+
+async fn google_access_token(
+    http: &reqwest::Client,
+    credential: &str,
+    configured_email: Option<&str>,
+    token_url: Option<&str>,
+) -> Result<String> {
+    let credential_json: Option<Value> = serde_json::from_str(credential).ok();
+    let email = credential_json
+        .as_ref()
+        .and_then(|value| value.get("client_email").and_then(Value::as_str))
+        .or(configured_email)
+        .ok_or_else(|| anyhow!("Google service-account email is not configured"))?;
+    let private_key = credential_json
+        .as_ref()
+        .and_then(|value| value.get("private_key").and_then(Value::as_str))
+        .ok_or_else(|| anyhow!("Google service-account private key is not configured"))?;
+    let token_url = credential_json
+        .as_ref()
+        .and_then(|value| value.get("token_uri").and_then(Value::as_str))
+        .or(token_url)
+        .unwrap_or("https://oauth2.googleapis.com/token");
+    let now = Utc::now().timestamp();
+    let claims = serde_json::json!({
+        "iss": email,
+        "scope": "https://www.googleapis.com/auth/androidpublisher",
+        "aud": token_url,
+        "iat": now,
+        "exp": now + 3600
+    });
+    let key = EncodingKey::from_rsa_pem(private_key.as_bytes())
+        .map_err(|error| anyhow!("invalid Google service-account key: {error}"))?;
+    let assertion = encode(&Header::new(Algorithm::RS256), &claims, &key)?;
+    let response = http
+        .post(token_url)
+        .form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+            ("assertion", assertion.as_str()),
+        ])
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        bail!("Google OAuth token exchange returned {}", response.status());
+    }
+    let response: Value = response.json().await?;
+    response
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("Google OAuth response has no access token"))
 }
 
 fn rsa_decoding_key(certificate: &[u8]) -> Option<DecodingKey> {
@@ -495,7 +1274,9 @@ pub fn provider_for(name: &str) -> Option<&'static dyn Provider> {
     match name {
         "paystack" => Some(&PAYSTACK),
         "apple_server_notifications" => Some(&APPLE_SERVER_NOTIFICATIONS),
+        "apple" => Some(&APPLE_SERVER_NOTIFICATIONS),
         "google_play_rtdn" => Some(GOOGLE_PLAY_RTDN.get_or_init(GooglePlayRtdnProvider::new)),
+        "google" | "google_play" => Some(GOOGLE_PLAY_RTDN.get_or_init(GooglePlayRtdnProvider::new)),
         "apple_connect_webhooks" => Some(&APPLE_CONNECT_WEBHOOKS),
         _ => None,
     }
