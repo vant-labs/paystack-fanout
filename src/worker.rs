@@ -72,7 +72,7 @@ pub async fn process_one(state: &AppState, delivery: ClaimedDelivery) {
     let request = request
         .header("x-fanout-event-id", fanout_event_id)
         .header("x-fanout-attempt", delivery.attempt.to_string())
-        .body(delivery.raw_body.clone())
+        .body(delivery.forward_body.clone())
         .send()
         .await;
     let latency_ms = i32::try_from(timer.elapsed().as_millis()).unwrap_or(i32::MAX);

@@ -38,6 +38,7 @@ async fn setup() -> (Arc<AppState>, Database) {
                 allowed_ips: vec![],
                 audience: None,
                 service_account: None,
+                provider_config: HashMap::new(),
             },
         )]),
         route: vec![RouteConfig {

@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::auth::{Role, SessionUser, token_hash};
 use crate::config::{Config, ExtendedRouteMatcher, RouteConfig, RouteMatcher, SourceConfig};
 use crate::crypto::{decrypt, encrypt};
+use crate::provider::{NormalizedEvent, NormalizedEventKind};
 
 #[derive(Clone)]
 pub struct Database {
@@ -24,6 +25,7 @@ pub struct ClaimedDelivery {
     pub event_id: Uuid,
     pub attempt: i32,
     pub raw_body: Vec<u8>,
+    pub forward_body: Vec<u8>,
     pub content_type: String,
     pub signature: String,
     pub provider_event_id: String,
@@ -242,6 +244,35 @@ pub struct SettingView {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct EntitlementView {
+    pub provider: String,
+    pub purchase_key: String,
+    pub licence: String,
+    pub product_id: String,
+    pub app_identifier: String,
+    pub environment: String,
+    pub status: String,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PurchaseApplyResult {
+    Applied,
+    CrossAccountReplay,
+    Unowned,
+    UnmappedProduct,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReconciliationPurchase {
+    pub provider: String,
+    pub purchase_key: String,
+    pub account_id: String,
+    pub product_id: String,
+}
+
 fn last_four(value: &str) -> Option<String> {
     let chars = value.chars().collect::<Vec<_>>();
     (chars.len() >= 4).then(|| chars[chars.len() - 4..].iter().collect())
@@ -283,7 +314,7 @@ impl Database {
         if source_count == 0 {
             for (name, source) in &config.source {
                 let secret = std::env::var(&source.secret_env).ok();
-                sqlx::query("INSERT INTO sources (id, name, provider, secret_ciphertext, allowed_ips, audience, service_account, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now())")
+                sqlx::query("INSERT INTO sources (id, name, provider, secret_ciphertext, allowed_ips, audience, service_account, provider_config, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), now())")
                     .bind(Uuid::new_v4())
                     .bind(name)
                     .bind(&source.provider)
@@ -291,6 +322,7 @@ impl Database {
                     .bind(serde_json::to_value(&source.allowed_ips)?)
                     .bind(&source.audience)
                     .bind(&source.service_account)
+                    .bind(serde_json::to_value(&source.provider_config)?)
                     .execute(&mut *tx)
                     .await?;
             }
@@ -321,7 +353,7 @@ impl Database {
     ) -> (Config, std::collections::HashMap<String, String>) {
         let mut config = base.clone();
         let mut secrets = std::collections::HashMap::new();
-        let source_rows = sqlx::query("SELECT name, provider, secret_ciphertext, allowed_ips, audience, service_account FROM sources WHERE enabled = true ORDER BY name")
+        let source_rows = sqlx::query("SELECT name, provider, secret_ciphertext, allowed_ips, audience, service_account, provider_config FROM sources WHERE enabled = true ORDER BY name")
             .fetch_all(&self.pool)
             .await;
         if let Ok(rows) = source_rows
@@ -351,6 +383,18 @@ impl Database {
                     .try_get::<Option<String>, _>("service_account")
                     .ok()
                     .flatten();
+                let provider_config = row
+                    .try_get::<Value, _>("provider_config")
+                    .ok()
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .filter(|value: &std::collections::HashMap<String, String>| !value.is_empty())
+                    .or_else(|| {
+                        config
+                            .source
+                            .get(&name)
+                            .map(|source| source.provider_config.clone())
+                    })
+                    .unwrap_or_default();
                 if let Ok(secret) = std::env::var(format!("{name}_SECRET_KEY")) {
                     secrets.insert(name.clone(), secret);
                 } else if !ciphertext.is_empty() {
@@ -377,6 +421,7 @@ impl Database {
                         allowed_ips,
                         audience,
                         service_account,
+                        provider_config,
                     },
                 );
             }
@@ -1320,18 +1365,54 @@ impl Database {
         status: &str,
         destination_url: Option<&str>,
     ) -> Result<InsertResult> {
+        self.insert_event_with_provider_event_id_and_normalized(
+            source,
+            event_type,
+            raw_body,
+            None,
+            content_type,
+            signature,
+            headers,
+            dedupe_key,
+            provider_event_id,
+            matched_route,
+            routing_reason,
+            status,
+            destination_url,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_event_with_provider_event_id_and_normalized(
+        &self,
+        source: &str,
+        event_type: &str,
+        raw_body: &[u8],
+        normalized_body: Option<&[u8]>,
+        content_type: &str,
+        signature: &str,
+        headers: &Value,
+        dedupe_key: &str,
+        provider_event_id: &str,
+        matched_route: Option<&str>,
+        routing_reason: Option<&str>,
+        status: &str,
+        destination_url: Option<&str>,
+    ) -> Result<InsertResult> {
         let event_id = Uuid::new_v4();
         let delivery_id = Uuid::new_v4();
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
         let inserted = sqlx::query(
-            r#"INSERT INTO events (id, source, event_type, raw_body, content_type, signature, headers, dedupe_key, provider_event_id, matched_route, routing_reason, status, received_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) ON CONFLICT (source, dedupe_key) DO NOTHING"#,
+            r#"INSERT INTO events (id, source, event_type, raw_body, normalized_body, content_type, signature, headers, dedupe_key, provider_event_id, matched_route, routing_reason, status, received_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT (source, dedupe_key) DO NOTHING"#,
         )
         .bind(event_id)
         .bind(source)
         .bind(event_type)
         .bind(raw_body)
+        .bind(normalized_body)
         .bind(content_type)
         .bind(signature)
         .bind(headers)
@@ -1395,10 +1476,181 @@ impl Database {
         Ok(())
     }
 
+    pub async fn apply_normalized_event(
+        &self,
+        event: &NormalizedEvent,
+    ) -> Result<PurchaseApplyResult> {
+        let Some(purchase_key) = event.purchase_key() else {
+            return Ok(PurchaseApplyResult::Unowned);
+        };
+        let mut tx = self.pool.begin().await?;
+        let existing = sqlx::query(
+            "SELECT account_id, licence, product_id, app_identifier, environment, original_transaction_id, purchase_token FROM store_purchases WHERE provider = $1 AND purchase_key = $2 FOR UPDATE",
+        )
+        .bind(&event.provider)
+        .bind(&purchase_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let owner = existing
+            .as_ref()
+            .and_then(|row| row.try_get::<Option<String>, _>("account_id").ok())
+            .flatten();
+        if existing.is_some()
+            && let Some(account_id) = event.account_id.as_deref()
+            && owner.as_deref().is_some_and(|owner| owner != account_id)
+        {
+            sqlx::query("INSERT INTO entitlement_audit (provider, purchase_key, account_id, event_id, action, metadata, created_at) VALUES ($1, $2, $3, $4, 'cross_account_replay', $5, now())")
+                .bind(&event.provider)
+                .bind(&purchase_key)
+                .bind(account_id)
+                .bind(&event.event_id)
+                .bind(serde_json::json!({"owner": owner, "product_id": event.product_id}))
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            return Ok(PurchaseApplyResult::CrossAccountReplay);
+        }
+        let account_id = event.account_id.as_deref().or(owner.as_deref());
+        let Some(account_id) = account_id else {
+            tx.rollback().await?;
+            return Ok(PurchaseApplyResult::Unowned);
+        };
+        let existing_licence = sqlx::query_scalar::<_, String>(
+            "SELECT licence FROM store_purchases WHERE provider = $1 AND purchase_key = $2",
+        )
+        .bind(&event.provider)
+        .bind(&purchase_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let licence = event.licence.as_deref().or(existing_licence.as_deref());
+        let Some(licence) = licence else {
+            tx.rollback().await?;
+            return Ok(PurchaseApplyResult::UnmappedProduct);
+        };
+        let existing_product_id = sqlx::query_scalar::<_, String>(
+            "SELECT product_id FROM store_purchases WHERE provider = $1 AND purchase_key = $2",
+        )
+        .bind(&event.provider)
+        .bind(&purchase_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let product_id = if event.product_id == "unknown" {
+            existing_product_id.as_deref().unwrap_or(&event.product_id)
+        } else {
+            &event.product_id
+        };
+        let status = match event.kind {
+            NormalizedEventKind::Grace => "grace",
+            NormalizedEventKind::Expire => "expired",
+            NormalizedEventKind::Refund => "refunded",
+            NormalizedEventKind::Revoke => "revoked",
+            _ => "active",
+        };
+        let expires_at = event
+            .expires_at
+            .as_deref()
+            .map(DateTime::parse_from_rfc3339)
+            .transpose()?
+            .map(|value| value.with_timezone(&Utc));
+        sqlx::query(
+            r#"INSERT INTO store_purchases
+               (id, provider, purchase_key, original_transaction_id, purchase_token, account_id,
+                product_id, licence, app_identifier, environment, status, expires_at,
+                last_event_id, first_seen_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now(), now())
+               ON CONFLICT (provider, purchase_key) DO UPDATE SET
+                 account_id = COALESCE(store_purchases.account_id, EXCLUDED.account_id),
+                 original_transaction_id = COALESCE(EXCLUDED.original_transaction_id, store_purchases.original_transaction_id),
+                 purchase_token = COALESCE(EXCLUDED.purchase_token, store_purchases.purchase_token),
+                 product_id = EXCLUDED.product_id,
+                 licence = EXCLUDED.licence,
+                 app_identifier = EXCLUDED.app_identifier,
+                 environment = EXCLUDED.environment,
+                 status = EXCLUDED.status,
+                 expires_at = EXCLUDED.expires_at,
+                 last_event_id = EXCLUDED.last_event_id,
+                 updated_at = now()"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(&event.provider)
+        .bind(&purchase_key)
+        .bind(&event.original_transaction_id)
+        .bind(&event.purchase_token)
+        .bind(account_id)
+        .bind(product_id)
+        .bind(licence)
+        .bind(&event.app_identifier)
+        .bind(&event.environment)
+        .bind(status)
+        .bind(expires_at)
+        .bind(&event.event_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("INSERT INTO entitlement_audit (provider, purchase_key, account_id, event_id, action, metadata, created_at) VALUES ($1, $2, $3, $4, $5, $6, now())")
+            .bind(&event.provider)
+            .bind(&purchase_key)
+            .bind(account_id)
+            .bind(&event.event_id)
+            .bind(event.kind.as_str())
+            .bind(&event.raw)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(PurchaseApplyResult::Applied)
+    }
+
+    pub async fn list_entitlements(&self, account_id: &str) -> Result<Vec<EntitlementView>> {
+        let rows = sqlx::query(
+            "SELECT provider, purchase_key, licence, product_id, app_identifier, environment, status, expires_at, updated_at FROM store_purchases WHERE account_id = $1 AND status IN ('active', 'grace') AND (expires_at IS NULL OR expires_at > now()) ORDER BY updated_at DESC",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(EntitlementView {
+                    provider: row.try_get("provider")?,
+                    purchase_key: row.try_get("purchase_key")?,
+                    licence: row.try_get("licence")?,
+                    product_id: row.try_get("product_id")?,
+                    app_identifier: row.try_get("app_identifier")?,
+                    environment: row.try_get("environment")?,
+                    status: row.try_get("status")?,
+                    expires_at: row.try_get("expires_at")?,
+                    updated_at: row.try_get("updated_at")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(Into::into)
+    }
+
+    pub async fn list_reconciliation_purchases(
+        &self,
+        provider: &str,
+    ) -> Result<Vec<ReconciliationPurchase>> {
+        let rows = sqlx::query(
+            "SELECT provider, purchase_key, account_id, product_id FROM store_purchases WHERE provider = $1 AND account_id IS NOT NULL ORDER BY updated_at ASC LIMIT 100",
+        )
+        .bind(provider)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ReconciliationPurchase {
+                    provider: row.try_get("provider")?,
+                    purchase_key: row.try_get("purchase_key")?,
+                    account_id: row.try_get("account_id")?,
+                    product_id: row.try_get("product_id")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(Into::into)
+    }
+
     pub async fn claim_delivery(&self) -> Result<Option<ClaimedDelivery>> {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            r#"SELECT d.id as delivery_id, d.event_id, d.attempts, e.raw_body, e.content_type, e.signature, e.provider_event_id, e.headers, d.destination_url, COALESCE(r.max_attempts, 10) AS max_attempts
+            r#"SELECT d.id as delivery_id, d.event_id, d.attempts, e.raw_body, COALESCE(e.normalized_body, e.raw_body) AS forward_body, e.content_type, e.signature, e.provider_event_id, e.headers, d.destination_url, COALESCE(r.max_attempts, 10) AS max_attempts
                FROM deliveries d JOIN events e ON e.id = d.event_id
                LEFT JOIN routes r ON r.id = d.route_id
                WHERE ((d.status IN ('pending', 'retrying') AND d.next_attempt_at <= now())
@@ -1424,6 +1676,7 @@ impl Database {
             event_id: row.try_get("event_id")?,
             attempt,
             raw_body: row.try_get("raw_body")?,
+            forward_body: row.try_get("forward_body")?,
             content_type: row.try_get("content_type")?,
             signature: row.try_get("signature")?,
             provider_event_id: row.try_get("provider_event_id")?,

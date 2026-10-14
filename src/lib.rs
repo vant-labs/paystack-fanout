@@ -9,6 +9,7 @@ pub mod db;
 pub mod metrics;
 pub mod openapi;
 pub mod provider;
+pub mod reconciliation;
 pub mod routing;
 pub mod security;
 pub mod worker;

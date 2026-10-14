@@ -30,12 +30,20 @@ flowchart LR
 
 The ingest path does only authentication, JSON field extraction, routing,
 transactional persistence, and acknowledgement. Forwarding never runs inline.
-The destination receives the original body and authentication headers,
-unchanged, plus `X-Fanout-Event-Id` and `X-Fanout-Attempt`.
+Paystack destinations receive the original body and authentication headers,
+unchanged. Store destinations receive the normalized event contract while the
+original provider body remains retained in the event ledger. All deliveries
+include `X-Fanout-Event-Id` and `X-Fanout-Attempt`.
 
 The implemented source providers are `paystack`,
 `apple_server_notifications`, `apple_connect_webhooks`, and
 `google_play_rtdn`.
+
+Store purchases use the same provider boundary and the same Postgres event,
+deduplication, outbox and delivery queue. Store adapters emit the normalized
+event types `purchase`, `renew`, `expire`, `grace`, `refund`, `revoke`,
+`upgrade`, and `downgrade`; Paystack payloads and delivery behavior remain
+unchanged.
 
 ## Quick start
 
@@ -159,12 +167,38 @@ email claim.
 RTDN messages are wrapped Pub/Sub envelopes. The adapter decodes
 `message.data`, routes on the notification's `packageName`, and uses the
 Pub/Sub `messageId` as the durable deduplication key. RTDN reports a state
-change rather than the complete purchase state, so the product should query
-the Google Play Developer API after receiving a notification. See Google's
+change rather than the complete purchase state, so the adapter queries the
+Google Play Developer API after receiving a notification, acknowledges pending
+purchases, and periodically reconciles stored purchases. See Google's
 [RTDN reference](https://developer.android.com/google/play/billing/rtdn-reference),
 [Pub/Sub push delivery](https://cloud.google.com/pubsub/docs/push), and
 [authenticated push subscriptions](https://cloud.google.com/pubsub/docs/authenticate-push-subscriptions)
 for the provider-side setup and payload contract.
+
+### Purchase verification and entitlements
+
+The client purchase flow is server-authoritative:
+
+```http
+POST /v1/purchases/verify
+Content-Type: application/json
+X-Timamu-Account-Id: account-123
+
+{"provider":"apple","receipt":"<transaction-id-or-signed-transaction>"}
+```
+
+For Google Play, use `purchaseToken` and optionally `productId`. The adapter
+verifies the purchase with the store API, checks the configured app identifier,
+product mapping and environment, acknowledges pending purchases, and emits
+the same normalized event used by notifications. A purchase identity is owned
+by one account; a second account receives `409` and the attempt is audited.
+
+Clients must read `GET /v1/entitlements?account_id=account-123` (or use the
+`X-Timamu-Account-Id` header). They must not grant access from a local receipt
+or token check. Configure store sources with `provider_config` mappings such
+as `app_identifier`, `environment`, `api_base_url` (for a test server), and
+`product_licence.<product-id>`. Key and service-account settings use `*_env`
+names and are resolved from secrets at runtime.
 
 An alert destination may be enabled with:
 

@@ -52,6 +52,7 @@ async fn setup(destination: String, alert_url: Option<String>) -> (Arc<AppState>
                 allowed_ips: vec![],
                 audience: None,
                 service_account: None,
+                provider_config: HashMap::new(),
             },
         )]),
         route: vec![RouteConfig {
@@ -180,6 +181,7 @@ async fn app_store_connect_rejects_tampered_and_wrong_secret_requests_with_401()
                 allowed_ips: vec![],
                 audience: None,
                 service_account: None,
+                provider_config: HashMap::new(),
             },
         )]),
         route: vec![],
@@ -245,6 +247,7 @@ async fn google_push_rejects_bad_token_with_401() {
                 allowed_ips: vec![],
                 audience: Some("https://example.test/in/google_main".into()),
                 service_account: Some("pubsub@example.iam.gserviceaccount.com".into()),
+                provider_config: HashMap::new(),
             },
         )]),
         route: vec![],

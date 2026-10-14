@@ -22,6 +22,8 @@ impl Modify for BearerAuth {
 #[openapi(
     paths(
         crate::app::ingest,
+        crate::app::verify_purchase,
+        crate::app::list_entitlements,
         crate::app::healthz,
         crate::app::readyz,
         crate::app::metrics,
@@ -51,14 +53,17 @@ impl Modify for BearerAuth {
             crate::app::ReplayBody,
             crate::app::RouteWriteBody,
             crate::app::SettingWriteBody,
-            crate::app::BootstrapBody
+            crate::app::BootstrapBody,
+            crate::app::VerifyPurchaseBody,
+            crate::db::EntitlementView
         )
     ),
     modifiers(&BearerAuth),
     tags(
         (name = "Webhook", description = "Paystack webhook ingestion"),
         (name = "Operations", description = "Health and Prometheus endpoints"),
-        (name = "Admin API", description = "Bearer-protected event operations")
+        (name = "Admin API", description = "Bearer-protected event operations"),
+        (name = "Purchases", description = "Provider-verified purchases and entitlements")
     ),
     info(
         title = "paystack-fanout API",

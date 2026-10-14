@@ -280,6 +280,7 @@ mod tests {
                     allowed_ips: vec![],
                     audience: None,
                     service_account: None,
+                    provider_config: HashMap::new(),
                 },
             )]),
             route: vec![
